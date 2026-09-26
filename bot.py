@@ -26,13 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
 import json
 import logging
 import os
 import random
 import re
 import secrets
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +87,9 @@ SPEEDS = {
 }
 SLOW_REPLAY_RATE = "-50%"   # bouton « 🐢 Plus lentement »
 
+# Pause entre les mots d'une phrase (clé : libellé, secondes).
+PAUSES = {"0.5": ("0,5 s", 0.5), "1": ("1 s", 1.0), "2": ("2 s", 2.0), "3": ("3 s", 3.0)}
+
 # Réglages par défaut d'un nouvel élève.
 DEFAULT_SETTINGS = {
     "long": True,      # voyelles longues (ا و ي)
@@ -94,10 +97,13 @@ DEFAULT_SETTINGS = {
     "shadda": False,   # chadda ( ّ )
     "hamza": False,    # hamza sur alif (أ إ)
     "speed": "lente",
+    "pause": "1",      # pause entre les mots d'une phrase
     "voice": DEFAULT_VOICE,
 }
 
-SESSION_SIZES = (3, 5, 10)
+SESSION_SIZES = {"w": (3, 5, 10), "p": (1, 3, 5)}   # mots / phrases par dictée
+# Taille des phrases (clé : libellé, nombre de mots).
+PHRASE_LENGTHS = {"court": ("3 mots", 3), "moyen": ("5 mots", 5), "long": ("7 mots", 7)}
 MIN_LETTERS = 2
 LETTERS_PER_ROW = 4
 REAL_WORD_RATIO = 0.7   # part de vrais mots dans une dictée (le reste est inventé)
@@ -416,24 +422,18 @@ def build_session_words(
 
 
 # ---------------------------------------------------------------------------
-# Synthèse vocale (fichiers temporaires)
+# Synthèse vocale (tout en mémoire, aucun fichier écrit)
 # ---------------------------------------------------------------------------
-
-async def _synthesize_edge(text: str, voice: str, rate: str, dest: Path) -> None:
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
-    await communicate.save(str(dest))
-    if not dest.exists() or dest.stat().st_size == 0:
-        raise RuntimeError("fichier audio vide")
-
-
-# --- Prononcer la voyelle finale -------------------------------------------------------
-# Seul, un mot est lu « à la pause » : la voix avale sa dernière voyelle (كَتَبَ → katab).
-# Pour l'apprentissage, on veut « kataba ». Astuce : on fait lire le mot suivi d'un mot
-# témoin (le mot n'est alors plus en fin de phrase, sa voyelle finale est prononcée),
-# puis on coupe l'audio juste après le mot grâce aux repères de temps envoyés par edge-tts.
+#
+# Voyelle finale : seul, un mot est lu « à la pause » et la voix avale sa dernière
+# voyelle (كَتَبَ → katab). Pour l'apprentissage on veut « kataba ». Astuce : on fait lire
+# le mot suivi d'un mot témoin (il n'est alors plus en fin de phrase), puis on coupe
+# l'audio juste après le mot grâce aux repères de temps envoyés par edge-tts.
+# Chaque audio se termine ensuite par END_SILENCE secondes de silence.
 
 CARRIER_WORD = "كَمْ"       # mot témoin, coupé de l'audio final
-CARRIER_MARGIN = 0.06       # secondes gardées après la fin du mot (évite de couper la voyelle)
+CARRIER_MARGIN = 0.1        # secondes gardées après la fin du mot (laisse la voyelle finir)
+END_SILENCE = 1.0           # secondes de silence ajoutées à la fin de chaque audio
 TICKS_PER_SECOND = 10_000_000
 
 
@@ -447,110 +447,141 @@ def ends_with_short_vowel(word: str) -> bool:
     return bool(trailing & set(SHORT_VOWELS))
 
 
+# --- Lecture des trames MP3 (couche III), pour couper et ajouter du silence -------------
+
 _MP3_BITRATES = {
-    1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],   # MPEG-1 couche III
-    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],       # MPEG-2 / 2.5 couche III
+    1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],   # MPEG-1
+    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],       # MPEG-2 / 2.5
 }
 _MP3_RATES = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000]}
 
 
-def trim_mp3(data: bytes, seconds: float) -> bytes | None:
-    """Garde les trames MP3 (couche III) qui commencent avant `seconds`. None si illisible."""
-    pos = 0
-    if data[:3] == b"ID3" and len(data) >= 10:  # en-tête ID3v2 éventuel
-        pos = 10 + ((data[6] << 21) | (data[7] << 14) | (data[8] << 7) | data[9])
-    start, elapsed, frames = pos, 0.0, 0
-    while pos + 4 <= len(data) and elapsed < seconds:
-        sync, info, fmt = data[pos], data[pos + 1], data[pos + 2]
-        if sync != 0xFF or (info & 0xE0) != 0xE0:
-            break
-        version, layer = (info >> 3) & 3, (info >> 1) & 3
-        bitrate_idx, rate_idx, padding = (fmt >> 4) & 0xF, (fmt >> 2) & 3, (fmt >> 1) & 1
-        if version == 1 or layer != 1 or bitrate_idx in (0, 15) or rate_idx == 3:
-            break
-        mpeg1 = version == 3
-        bitrate = _MP3_BITRATES[1 if mpeg1 else 2][bitrate_idx] * 1000
-        rate = _MP3_RATES[version][rate_idx]
-        length = (144 if mpeg1 else 72) * bitrate // rate + padding
-        if length <= 4:
-            break
-        pos += length
-        elapsed += (1152 if mpeg1 else 576) / rate
-        frames += 1
-    if frames == 0:
+def _frame_info(header: bytes) -> tuple[int, float, tuple] | None:
+    """(longueur en octets, durée en secondes, format) d'une trame, ou None."""
+    if len(header) < 4 or header[0] != 0xFF or (header[1] & 0xE0) != 0xE0:
         return None
-    return data[:min(pos, len(data))] if start == 0 else data[start:min(pos, len(data))]
+    version, layer = (header[1] >> 3) & 3, (header[1] >> 1) & 3
+    bitrate_idx, rate_idx, padding = (header[2] >> 4) & 0xF, (header[2] >> 2) & 3, (header[2] >> 1) & 1
+    if version == 1 or layer != 1 or bitrate_idx in (0, 15) or rate_idx == 3:
+        return None
+    mpeg1 = version == 3
+    bitrate = _MP3_BITRATES[1 if mpeg1 else 2][bitrate_idx] * 1000
+    rate = _MP3_RATES[version][rate_idx]
+    length = (144 if mpeg1 else 72) * bitrate // rate + padding
+    if length <= 4:
+        return None
+    fmt = (version, rate_idx, header[3] >> 6)  # version, fréquence, mono/stéréo
+    return length, (1152 if mpeg1 else 576) / rate, fmt
 
 
-async def _synthesize_edge_full_vowel(text: str, voice: str, rate: str, dest: Path) -> None:
+def _audio_start(data: bytes) -> int:
+    if data[:3] == b"ID3" and len(data) >= 10:  # en-tête ID3v2 éventuel
+        return 10 + ((data[6] << 21) | (data[7] << 14) | (data[8] << 7) | data[9])
+    return 0
+
+
+def mp3_format(data: bytes) -> tuple | None:
+    info = _frame_info(data[_audio_start(data):][:4])
+    return info[2] if info else None
+
+
+def trim_mp3(data: bytes, seconds: float) -> bytes | None:
+    """Garde les trames qui commencent avant `seconds`. None si illisible."""
+    start = pos = _audio_start(data)
+    elapsed, frames = 0.0, 0
+    while pos + 4 <= len(data) and elapsed < seconds:
+        info = _frame_info(data[pos:pos + 4])
+        if not info:
+            break
+        pos += info[0]
+        elapsed += info[1]
+        frames += 1
+    return data[start:min(pos, len(data))] if frames else None
+
+
+def mp3_silence(like: bytes, seconds: float) -> bytes:
+    """Trames muettes au même format que `like` (en-tête copié, contenu à zéro = silence)."""
+    start = _audio_start(like)
+    header = bytearray(like[start:start + 4])
+    if not _frame_info(bytes(header)):
+        return b""
+    header[1] |= 0x01    # pas de somme de contrôle CRC
+    header[2] &= ~0x02   # pas d'octet de bourrage
+    length, duration, _ = _frame_info(bytes(header))
+    frame = bytes(header) + bytes(length - 4)
+    return frame * max(1, round(seconds / duration))
+
+
+async def _edge_audio(text: str, voice: str, rate: str, word_boundary: bool = False):
+    """Renvoie (octets MP3, fin du premier mot en secondes ou None)."""
     communicate = edge_tts.Communicate(
-        f"{text} {CARRIER_WORD}", voice, rate=rate, boundary="WordBoundary"
+        text, voice, rate=rate, boundary="WordBoundary" if word_boundary else "SentenceBoundary"
     )
     audio = bytearray()
-    word_end: float | None = None
+    first_word_end = None
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio += chunk["data"]
-        elif chunk["type"] == "WordBoundary" and word_end is None:
-            word_end = (chunk["offset"] + chunk["duration"]) / TICKS_PER_SECOND
-    if word_end is None or not audio:
-        raise RuntimeError("repères de mots absents")
-    trimmed = trim_mp3(bytes(audio), word_end + CARRIER_MARGIN)
-    if not trimmed:
-        raise RuntimeError("découpage MP3 impossible")
-    dest.write_bytes(trimmed)
+        elif chunk["type"] == "WordBoundary" and first_word_end is None:
+            first_word_end = (chunk["offset"] + chunk["duration"]) / TICKS_PER_SECOND
+    if not audio:
+        raise RuntimeError("audio vide")
+    return bytes(audio), first_word_end
 
 
-def _synthesize_gtts(text: str, dest: Path) -> None:
-    gTTS(text=text, lang="ar", slow=True).save(str(dest))
+def _gtts_audio(text: str) -> bytes:
+    buffer = io.BytesIO()
+    gTTS(text=text, lang="ar", slow=True).write_to_fp(buffer)
+    return buffer.getvalue()
 
 
-async def synthesize(text: str, voice: str, rate: str) -> Path:
-    """Crée un MP3 temporaire prononçant `text`. L'appelant doit le supprimer."""
-    fd, name = tempfile.mkstemp(suffix=".mp3", dir=AUDIO_TMP_DIR)
-    os.close(fd)
-    path = Path(name)
-    try:
-        if ends_with_short_vowel(text):
-            try:
-                await _synthesize_edge_full_vowel(text, voice, rate, path)
-                return path
-            except Exception as exc:
-                logger.warning("Voyelle finale non forcée pour %s (%s)", text, exc)
+async def speak(text: str, voice: str, rate: str) -> bytes:
+    """MP3 d'un mot ou d'un texte, voyelle finale prononcée si besoin (sans silence final)."""
+    if ends_with_short_vowel(text):
         try:
-            await _synthesize_edge(text, voice, rate, path)
+            audio, word_end = await _edge_audio(f"{text} {CARRIER_WORD}", voice, rate, word_boundary=True)
+            trimmed = trim_mp3(audio, word_end + CARRIER_MARGIN) if word_end else None
+            if trimmed:
+                return trimmed
+            raise RuntimeError("repères de mots absents")
         except Exception as exc:
-            logger.warning("edge-tts en échec avec %s (%s)", voice, exc)
-            if voice != DEFAULT_VOICE:
-                try:
-                    await _synthesize_edge(text, DEFAULT_VOICE, rate, path)
-                    return path
-                except Exception:
-                    pass
-            await asyncio.to_thread(_synthesize_gtts, text, path)
-        return path
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+            logger.warning("Voyelle finale non forcée pour %s (%s)", text, exc)
+    for candidate in dict.fromkeys((voice, DEFAULT_VOICE)):
+        try:
+            return (await _edge_audio(text, candidate, rate))[0]
+        except Exception as exc:
+            logger.warning("edge-tts en échec avec %s (%s)", candidate, exc)
+    return await asyncio.to_thread(_gtts_audio, text)
+
+
+async def render_audio(words: list[str], voice: str, rate: str, pause: float) -> bytes:
+    """Audio final : un mot, ou une phrase mot par mot avec `pause` secondes entre les mots,
+    puis END_SILENCE secondes de silence."""
+    segments = await asyncio.gather(*(speak(w, voice, rate) for w in words))
+    formats = {mp3_format(s) for s in segments}
+    if len(segments) > 1 and (len(formats) != 1 or None in formats):
+        # Formats différents (voix de secours) : on lit la phrase d'un seul bloc.
+        segments = [await speak(" ، ".join(words), voice, rate)]
+    audio = segments[0]
+    for segment in segments[1:]:
+        audio += mp3_silence(audio, pause) + segment[_audio_start(segment):]
+    return audio + mp3_silence(audio, END_SILENCE)
 
 
 async def send_voice_note(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, voice: str, rate: str,
-    caption: str, reply_markup: InlineKeyboardMarkup | None = None,
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, words: list[str], voice: str, rate: str,
+    pause: float, caption: str, reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
-    path = await synthesize(text, voice, rate)
-    try:
-        with path.open("rb") as audio:
-            await context.bot.send_voice(
-                chat_id, voice=audio, caption=caption,
-                parse_mode=ParseMode.HTML, reply_markup=reply_markup,
-            )
-    finally:
-        path.unlink(missing_ok=True)  # nettoyage du fichier temporaire
+    audio = await render_audio(words, voice, rate, pause)
+    await context.bot.send_voice(
+        chat_id, voice=audio, filename="dictee.mp3", caption=caption,
+        parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+    )
 
 
 def clean_temp_audio() -> None:
+    """Supprime d'anciens fichiers audio temporaires (versions précédentes du bot)."""
     for leftover in AUDIO_TMP_DIR.glob("*.mp3"):
         leftover.unlink(missing_ok=True)
 
@@ -565,7 +596,16 @@ def settings_of(context: ContextTypes.DEFAULT_TYPE) -> dict:
         settings.setdefault(key, value)
     if settings["voice"] not in {v for v, _ in VOICES}:
         settings["voice"] = DEFAULT_VOICE
+    if settings["pause"] not in PAUSES:
+        settings["pause"] = DEFAULT_SETTINGS["pause"]
     return settings
+
+
+def audio_params(settings: dict, slow: bool = False) -> tuple[str, str, float]:
+    """(voix, débit, pause entre les mots) selon les réglages de l'élève."""
+    rate = SLOW_REPLAY_RATE if slow else SPEEDS[settings["speed"]][1]
+    pause = PAUSES[settings["pause"]][1] * (1.5 if slow else 1)
+    return settings["voice"], rate, pause
 
 
 def voice_label(voice: str) -> str:
@@ -579,7 +619,8 @@ def settings_summary(settings: dict) -> str:
         f"{mark('long')} voyelles longues   {mark('sukun')} soukoun   "
         f"{mark('shadda')} chadda   {mark('hamza')} hamza\n"
         f"🔊 {voice_label(settings['voice']).split(' —')[0]}, vitesse "
-        f"{SPEEDS[settings['speed']][0].lower()}"
+        f"{SPEEDS[settings['speed']][0].lower()}, pause entre les mots "
+        f"{PAUSES[settings['pause']][0]}"
     )
 
 
@@ -591,6 +632,8 @@ def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         [toggle("sukun", "Soukoun ( ـْ )"), toggle("shadda", "Chadda ( ـّ )")],
         [toggle("hamza", "Hamza (أ إ)")],
         [InlineKeyboardButton(f"🐢 Vitesse : {SPEEDS[settings['speed']][0]}", callback_data="O:speed")],
+        [InlineKeyboardButton(f"⏸️ Pause entre les mots (phrases) : {PAUSES[settings['pause']][0]}",
+                              callback_data="O:pause")],
         [InlineKeyboardButton(f"🎙️ Voix : {voice_label(settings['voice'])}", callback_data="O:voice")],
     ])
 
@@ -658,9 +701,11 @@ async def safe_edit_text(query, text: str, reply_markup=None) -> None:
 
 def word_keyboard(session: dict, index: int, revealed: bool) -> InlineKeyboardMarkup:
     sid = session["id"]
-    is_last = index == len(session["words"]) - 1
+    is_last = index == len(session["items"]) - 1
+    unit = "Phrase" if session["mode"] == "p" else "Mot"
     first = (
-        InlineKeyboardButton("🏁 Voir le bilan" if is_last else "➡️ Mot suivant", callback_data=f"N:{sid}:{index}")
+        InlineKeyboardButton("🏁 Voir le bilan" if is_last else f"➡️ {unit} suivant{'e' if unit == 'Phrase' else ''}",
+                             callback_data=f"N:{sid}:{index}")
         if revealed
         else InlineKeyboardButton("👁️ Afficher la réponse", callback_data=f"R:{sid}:{index}")
     )
@@ -676,6 +721,28 @@ def meaning_line(word: dict) -> str:
     return "🧪 <i>Mot inventé (pas de sens), juste pour l'entraînement</i>"
 
 
+def item_text(item: list[dict]) -> str:
+    return " ".join(w["ar"] for w in item)
+
+
+def item_label(session: dict, index: int) -> str:
+    unit = "Phrase" if session["mode"] == "p" else "Mot"
+    return f"{unit} {index + 1}/{len(session['items'])}"
+
+
+def reveal_caption(session: dict, index: int) -> str:
+    item = session["items"][index]
+    if len(item) == 1:
+        word = item[0]
+        details = f"🔤 {html.escape(spelled_letters(word['ar']))}\n{meaning_line(word)}"
+    else:
+        details = "\n".join(
+            f"• {html.escape(w['ar'])} — " + (html.escape(w["fr"]) if w["fr"] else "🧪 <i>inventé</i>")
+            for w in item
+        )
+    return f"🎧 <b>{item_label(session, index)}</b>\n\n✍️ <b>{html.escape(item_text(item))}</b>\n{details}"
+
+
 # ---------------------------------------------------------------------------
 # Commandes
 # ---------------------------------------------------------------------------
@@ -684,8 +751,8 @@ HELP_TEXT = (
     "السَّلَامُ عَلَيْكُم 👋\n\n"
     "Je t'aide à t'entraîner à la <b>dictée en arabe</b>.\n\n"
     "1️⃣ /lettres : coche les lettres que tu as déjà apprises\n"
-    "2️⃣ /reglages : voyelles longues, soukoun, chadda, hamza, vitesse\n"
-    "3️⃣ /dictee : lance une dictée avec uniquement ce que tu as vu\n"
+    "2️⃣ /reglages : voyelles longues, soukoun, chadda, hamza, vitesse, pauses\n"
+    "3️⃣ /dictee : dictée de mots ou de phrases, avec uniquement ce que tu as vu\n"
     "🎙️ /voix : choisis la voix qui te parle le mieux\n"
     "⏹ /stop : arrête la dictée en cours\n\n"
     "Je te dicte surtout de vrais mots (avec leur traduction), et j'invente des mots "
@@ -783,9 +850,9 @@ async def on_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.answer()
         await send_voices_menu(query.message.chat_id, context)
         return
-    if key == "speed":
-        order = list(SPEEDS)
-        settings["speed"] = order[(order.index(settings["speed"]) + 1) % len(order)]
+    if key in ("speed", "pause"):
+        options = list(SPEEDS if key == "speed" else PAUSES)
+        settings[key] = options[(options.index(settings[key]) + 1) % len(options)]
     elif key in ("long", "sukun", "shadda", "hamza"):
         settings[key] = not settings[key]
     await query.answer("Réglage enregistré ✅")
@@ -819,7 +886,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keep_kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Garder cette voix", callback_data=f"K:{index}")]])
     try:
         await send_voice_note(
-            context, query.message.chat_id, VOICE_SAMPLE, voice, SPEEDS[settings["speed"]][1],
+            context, query.message.chat_id, [VOICE_SAMPLE], voice, SPEEDS[settings["speed"]][1], 0,
             f"🎙️ <b>{html.escape(label)}</b>\n{VOICE_SAMPLE}", keep_kb,
         )
     except Exception:
@@ -837,83 +904,106 @@ async def send_dictation_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) 
     if problem:
         await context.bot.send_message(chat_id, problem)
         return
-    buttons = [InlineKeyboardButton(f"{n} mots", callback_data=f"C:{n}") for n in SESSION_SIZES]
     await context.bot.send_message(
         chat_id,
         f"📝 <b>Nouvelle dictée</b>\n"
         f"Lettres : {' '.join(ordered(letters))}\n"
         f"{settings_summary(settings_of(context))}\n"
         "<i>(modifiable avec /reglages)</i>\n\n"
-        "Combien de mots veux-tu ?",
+        "Que veux-tu travailler ?",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([buttons]),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔤 Des mots", callback_data="M:w"),
+            InlineKeyboardButton("🗣️ Des phrases", callback_data="M:p"),
+        ]]),
     )
+
+
+async def on_choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    unit = "phrases" if mode == "p" else "mots"
+    buttons = [InlineKeyboardButton(f"{n} {unit if n > 1 else unit[:-1]}", callback_data=f"C:{mode}:{n}")
+               for n in SESSION_SIZES[mode]]
+    await safe_edit_text(query, f"📝 <b>Dictée de {unit}</b>\nCombien ?",
+                         reply_markup=InlineKeyboardMarkup([buttons]))
 
 
 async def on_choose_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    count = int(query.data.split(":", 1)[1])
-    buttons = [
-        InlineKeyboardButton(label, callback_data=f"G:{count}:{key}")
-        for key, (label, _) in WORD_LENGTHS.items()
-    ]
-    await safe_edit_text(
-        query, f"📝 <b>{count} mots</b>\nQuelle longueur de mots ?",
-        reply_markup=InlineKeyboardMarkup([buttons]),
-    )
+    _, mode, raw_count = query.data.split(":")
+    count = int(raw_count)
+    if mode == "p":
+        options = {key: label for key, (label, _) in PHRASE_LENGTHS.items()}
+        question = "Combien de mots par phrase ?"
+    else:
+        options = {key: label for key, (label, _) in WORD_LENGTHS.items()}
+        question = "Quelle longueur de mots ?"
+    buttons = [InlineKeyboardButton(label, callback_data=f"G:{mode}:{count}:{key}") for key, label in options.items()]
+    await safe_edit_text(query, f"📝 <b>{count} × {'phrase' if mode == 'p' else 'mot'}</b>\n{question}",
+                         reply_markup=InlineKeyboardMarkup([buttons]))
 
 
 async def on_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    _, raw_count, length_key = query.data.split(":")
+    _, mode, raw_count, length_key = query.data.split(":")
     count = int(raw_count)
 
     letters: set[str] = context.user_data.get("letters", set())
     problem = letters_problem(letters)
-    if problem or length_key not in WORD_LENGTHS:
+    lengths = PHRASE_LENGTHS if mode == "p" else WORD_LENGTHS
+    if problem or length_key not in lengths:
         await safe_edit_text(query, problem or "⚠️ Relance /dictee.")
         return
 
     settings = settings_of(context)
     recent: list[str] = context.user_data.setdefault("recent_real", [])
-    words = build_session_words(letters, settings, count, length_key, recent)
-    for w in words:
-        if w["fr"]:
-            recent.append(w["ar"])
+    if mode == "p":
+        size = PHRASE_LENGTHS[length_key][1]
+        items = [
+            build_session_words(letters, settings, size, random.choice(["court", "moyen"]), recent)
+            for _ in range(count)
+        ]
+        intro = f"🗣️ <b>C'est parti : {count} phrase(s) de {size} mots</b>\n" \
+                f"⏸️ {PAUSES[settings['pause']][0]} de pause entre les mots (modifiable dans /reglages)\n"
+    else:
+        items = [[w] for w in build_session_words(letters, settings, count, length_key, recent)]
+        intro = f"🎧 <b>C'est parti : {count} mots {WORD_LENGTHS[length_key][0].lower()}</b>\n"
+    all_words = [w for item in items for w in item]
+    recent.extend(w["ar"] for w in all_words if w["fr"])
     del recent[:-RECENT_REAL_MAX]
 
-    context.user_data["session"] = {"id": secrets.token_hex(4), "words": words, "index": 0}
-    n_real = sum(1 for w in words if w["fr"])
+    context.user_data["session"] = {"id": secrets.token_hex(4), "mode": mode, "items": items, "index": 0}
+    n_real = sum(1 for w in all_words if w["fr"])
     await safe_edit_text(
         query,
-        f"🎧 <b>C'est parti : {count} mots {WORD_LENGTHS[length_key][0].lower()}</b>\n"
-        f"📖 {n_real} vrai(s) mot(s), 🧪 {count - n_real} inventé(s)\n"
-        "Écoute, écris le mot sur ta feuille, puis vérifie.",
+        intro + f"📖 {n_real} vrai(s) mot(s), 🧪 {len(all_words) - n_real} inventé(s)\n"
+        "Écoute, écris sur ta feuille, puis vérifie.",
     )
-    await send_current_word(query.message.chat_id, context)
+    await send_current_item(query.message.chat_id, context)
 
 
-async def send_current_word(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_current_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.user_data["session"]
     index = session["index"]
-    total = len(session["words"])
-    word = session["words"][index]
-    settings = settings_of(context)
+    item = session["items"][index]
+    voice, rate, pause = audio_params(settings_of(context))
     try:
         await send_voice_note(
-            context, chat_id, word["ar"], settings["voice"], SPEEDS[settings["speed"]][1],
-            f"🎧 <b>Mot {index + 1}/{total}</b> — écoute et écris-le sur ta feuille.",
+            context, chat_id, [w["ar"] for w in item], voice, rate, pause,
+            f"🎧 <b>{item_label(session, index)}</b> — écoute et écris sur ta feuille.",
             word_keyboard(session, index, revealed=False),
         )
     except Exception:
-        logger.exception("Échec de l'envoi audio pour %s", word["ar"])
+        logger.exception("Échec de l'envoi audio pour %s", item_text(item))
         skip_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➡️ Mot suivant", callback_data=f"N:{session['id']}:{index}")
+            InlineKeyboardButton("➡️ Suivant", callback_data=f"N:{session['id']}:{index}")
         ]])
         await context.bot.send_message(
-            chat_id, f"❌ Impossible de générer l'audio du mot {index + 1}/{total} pour le moment.",
+            chat_id, f"❌ Impossible de générer l'audio ({item_label(session, index)}) pour le moment.",
             reply_markup=skip_kb,
         )
 
@@ -922,7 +1012,7 @@ def _active_session(context: ContextTypes.DEFAULT_TYPE, data: str) -> tuple[dict
     _, session_id, raw_index = data.split(":")
     session = context.user_data.get("session")
     index = int(raw_index)
-    if not session or session["id"] != session_id or index >= len(session["words"]):
+    if not session or session.get("id") != session_id or index >= len(session.get("items", [])):
         return None
     return session, index
 
@@ -935,16 +1025,9 @@ async def on_reveal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     session, index = found
     await query.answer()
-    word = session["words"][index]
-    caption = (
-        f"🎧 <b>Mot {index + 1}/{len(session['words'])}</b>\n\n"
-        f"✍️ <b>{html.escape(word['ar'])}</b>\n"
-        f"🔤 {html.escape(spelled_letters(word['ar']))}\n"
-        f"{meaning_line(word)}"
-    )
     try:
         await query.edit_message_caption(
-            caption=caption, parse_mode=ParseMode.HTML,
+            caption=reveal_caption(session, index), parse_mode=ParseMode.HTML,
             reply_markup=word_keyboard(session, index, revealed=True),
         )
     except BadRequest as exc:
@@ -960,11 +1043,11 @@ async def on_slow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     session, index = found
     await query.answer("Version lente 🐢")
-    settings = settings_of(context)
+    voice, rate, pause = audio_params(settings_of(context), slow=True)
     try:
         await send_voice_note(
-            context, query.message.chat_id, session["words"][index]["ar"], settings["voice"],
-            SLOW_REPLAY_RATE, f"🐢 Mot {index + 1}, au ralenti",
+            context, query.message.chat_id, [w["ar"] for w in session["items"][index]], voice, rate, pause,
+            f"🐢 {item_label(session, index)}, au ralenti",
         )
     except Exception:
         logger.exception("Échec de la version lente")
@@ -985,24 +1068,26 @@ async def on_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
     session["index"] += 1
     chat_id = query.message.chat_id
-    if session["index"] >= len(session["words"]):
+    if session["index"] >= len(session["items"]):
         await send_summary(chat_id, context)
     else:
-        await send_current_word(chat_id, context)
+        await send_current_item(chat_id, context)
 
 
 async def send_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.user_data.pop("session")
-    lines = [
-        f"{i}. <b>{html.escape(w['ar'])}</b> — "
-        + (html.escape(w["fr"]) if w["fr"] else "🧪 inventé")
-        for i, w in enumerate(session["words"], start=1)
-    ]
+    lines = []
+    for i, item in enumerate(session["items"], start=1):
+        if len(item) == 1:
+            w = item[0]
+            lines.append(f"{i}. <b>{html.escape(w['ar'])}</b> — "
+                         + (html.escape(w["fr"]) if w["fr"] else "🧪 inventé"))
+        else:
+            lines.append(f"{i}. <b>{html.escape(item_text(item))}</b>")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Nouvelle dictée", callback_data="D:NEW")]])
     await context.bot.send_message(
         chat_id,
-        f"🏁 <b>Bilan de la dictée</b> — {len(lines)} mots\n\n"
-        + "\n".join(lines)
+        f"🏁 <b>Bilan de la dictée</b>\n\n" + "\n".join(lines)
         + "\n\n📄 Compare avec ta feuille. بَارَكَ اللهُ فِيكَ !",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
@@ -1063,8 +1148,9 @@ def build_application(token: str, builder=None) -> Application:
     app.add_handler(CallbackQueryHandler(on_letters, pattern=r"^L:"))
     app.add_handler(CallbackQueryHandler(on_setting, pattern=r"^O:\w+$"))
     app.add_handler(CallbackQueryHandler(on_voice, pattern=r"^[VK]:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_choose_count, pattern=r"^C:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^G:\d+:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_choose_mode, pattern=r"^M:[wp]$"))
+    app.add_handler(CallbackQueryHandler(on_choose_count, pattern=r"^C:[wp]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^G:[wp]:\d+:\w+$"))
     app.add_handler(CallbackQueryHandler(on_reveal, pattern=r"^R:"))
     app.add_handler(CallbackQueryHandler(on_slow, pattern=r"^S:"))
     app.add_handler(CallbackQueryHandler(on_next, pattern=r"^N:"))
