@@ -413,21 +413,36 @@ def invented_word(letters: set[str], length_key: str, settings: dict) -> WordInf
 
 
 def build_session_words(
-    letters: set[str], settings: dict, count: int, length_key: str, recent: list[str]
+    letters: set[str], settings: dict, count: int, length_key: str, recent: list[str],
+    taken: set[str] | None = None,
 ) -> list[dict]:
-    """Mélange de vrais mots (priorité aux moins récents) et de mots inventés."""
-    pool = eligible_real_words(letters, settings, length_key)
+    """Mélange de vrais mots (priorité aux moins récents) et de mots inventés.
+
+    `taken` = mots déjà utilisés dans la dictée en cours : ils ne reviennent pas
+    (utile pour que chaque phrase ait des mots différents). Il est mis à jour.
+    """
+    taken = taken if taken is not None else set()
+    pool = [w for w in eligible_real_words(letters, settings, length_key) if w.arabic not in taken]
     random.shuffle(pool)
     pool.sort(key=lambda w: w.arabic in recent)  # les mots non vus récemment d'abord
     n_real = min(len(pool), round(count * REAL_WORD_RATIO))
     chosen = pool[:n_real]
+    taken.update(w.arabic for w in chosen)
 
-    taken = {w.arabic for w in chosen}
+    # Longueurs essayées pour inventer un mot nouveau : celle demandée, puis plus longues
+    # (avec très peu de lettres, les mots courts possibles s'épuisent vite).
+    fallback_lengths = [length_key] + [k for k in WORD_LENGTHS if k != length_key]
     while len(chosen) < count:
-        for _ in range(40):
-            word = invented_word(letters, length_key, settings)
-            if word.arabic not in taken:
+        word = None
+        for key in fallback_lengths:
+            for _ in range(150):
+                candidate = invented_word(letters, key, settings)
+                if candidate.arabic not in taken:
+                    word = candidate
+                    break
+            if word:
                 break
+        word = word or candidate   # vraiment plus aucun mot nouveau possible : on accepte un doublon
         taken.add(word.arabic)
         chosen.append(word)
 
@@ -580,7 +595,9 @@ async def speak(text: str, voice: str, rate: str) -> bytes:
 # n'est pas modifié.
 
 SAMPLE_RATE = 24000
-MADD_STRETCH = 0.22   # secondes ajoutées à chaque voyelle longue en mode normal
+# Secondes ajoutées à chaque voyelle longue en mode normal, selon la lettre de prolongation.
+# Le « aa » (alif) s'entend moins que « ouu » et « ii » : on l'allonge davantage.
+MADD_STRETCH = {"ا": 0.35, "و": 0.22, "ي": 0.22}
 FADE = 0.015          # fondu (s) en fin de mot coupé, pour éviter un « clic »
 
 
@@ -642,7 +659,7 @@ def phonetic_units(word: str) -> list[tuple[str, float]]:
         else:
             has_mark = i + 1 < len(word) and word[i + 1] in MARKS
             if not has_mark and LONG_VOWEL_LETTER.get(prev_vowel) == ch:
-                units.append(("L", 2.2))
+                units.append(("L" + ch, 2.2))    # « Lا », « Lو » ou « Lي »
             else:
                 units.append(("C", 1.0))
             prev_vowel = None
@@ -788,20 +805,21 @@ def _psola_stretch(x: "np.ndarray", marks: list[int], extra: int) -> "np.ndarray
 
 
 def stretch_long_vowels(pcm: "np.ndarray", word: str, start: float, end: float,
-                        extra: float = MADD_STRETCH) -> "np.ndarray":
+                        extra: dict | None = None) -> "np.ndarray":
     """Allonge chaque voyelle longue du mot d'environ `extra` secondes (TD-PSOLA)."""
     units = phonetic_units(word)
     total = sum(w for _, w in units)
     if not total or end <= start:
         return pcm
     targets, cumul = [], 0.0
+    extra = extra or MADD_STRETCH
     for kind, weight in units:
-        if kind == "L":
+        if kind.startswith("L"):
             center = start + (end - start) * (cumul + weight / 2) / total
             half = (end - start) * weight / total * 0.6
-            targets.append((int(center * SAMPLE_RATE), int(half * SAMPLE_RATE)))
+            targets.append((int(center * SAMPLE_RATE), int(half * SAMPLE_RATE), extra[kind[1]]))
         cumul += weight
-    for center, half in reversed(targets):   # de la fin vers le début : les indices restent valables
+    for center, half, seconds in reversed(targets):   # de la fin vers le début : indices valables
         found = _find_vowel(pcm, center, half)
         if not found:
             continue
@@ -809,7 +827,7 @@ def stretch_long_vowels(pcm: "np.ndarray", word: str, start: float, end: float,
         marks = _pitch_marks(pcm, v_start, v_end, period)
         if len(marks) < 4 or marks[-1] - marks[0] < 3 * period:
             continue   # voyelle trop courte ou irrégulière : on n'y touche pas
-        pcm = _psola_stretch(pcm, marks, int(extra * SAMPLE_RATE))
+        pcm = _psola_stretch(pcm, marks, int(seconds * SAMPLE_RATE))
     return pcm
 
 
@@ -1295,8 +1313,9 @@ async def on_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     recent: list[str] = context.user_data.setdefault("recent_real", [])
     if mode == "p":
         size = PHRASE_LENGTHS[length_key][1]
+        taken: set[str] = set()   # aucun mot ne revient d'une phrase à l'autre
         items = [
-            build_session_words(letters, settings, size, random.choice(["court", "moyen"]), recent)
+            build_session_words(letters, settings, size, random.choice(["court", "moyen"]), recent, taken)
             for _ in range(count)
         ]
         intro = f"🗣️ <b>C'est parti : {count} phrase(s) de {size} mots</b>\n" \
