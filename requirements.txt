@@ -2,3 +2,5 @@ python-telegram-bot>=22.0,<23
 edge-tts>=7.0,<8
 gTTS>=2.5,<3
 python-dotenv>=1.0
+numpy>=1.26
+imageio-ffmpeg>=0.5

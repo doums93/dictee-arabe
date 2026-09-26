@@ -33,10 +33,16 @@ import os
 import random
 import re
 import secrets
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 import edge_tts
+
+try:
+    import numpy as np
+except ImportError:  # sans numpy : pas de prolongement, audio simple
+    np = None
 from dotenv import load_dotenv
 from gtts import gTTS
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -93,9 +99,6 @@ MODES = {
     "normal": "🟢 Normal : prolongements appuyés",
     "difficile": "🔴 Difficile : voix naturelle",
 }
-# Mode normal : nombre de lettres de prolongation AJOUTÉES à l'oral (بَاب → بَاااب lu par la
-# voix ; l'écriture affichée reste بَاب).
-MADD_EXTRA = 2
 
 # Pause entre les mots d'une phrase (clé : libellé, secondes).
 PAUSES = {"0.5": ("0,5 s", 0.5), "1": ("1 s", 1.0), "2": ("2 s", 2.0), "3": ("3 s", 3.0)}
@@ -524,20 +527,21 @@ def mp3_silence(like: bytes, seconds: float) -> bytes:
 
 
 async def _edge_audio(text: str, voice: str, rate: str, word_boundary: bool = False):
-    """Renvoie (octets MP3, fin du premier mot en secondes ou None)."""
+    """Renvoie (octets MP3, liste des mots [(début, fin)] en secondes)."""
     communicate = edge_tts.Communicate(
         text, voice, rate=rate, boundary="WordBoundary" if word_boundary else "SentenceBoundary"
     )
     audio = bytearray()
-    first_word_end = None
+    words: list[tuple[float, float]] = []
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio += chunk["data"]
-        elif chunk["type"] == "WordBoundary" and first_word_end is None:
-            first_word_end = (chunk["offset"] + chunk["duration"]) / TICKS_PER_SECOND
+        elif chunk["type"] == "WordBoundary":
+            start = chunk["offset"] / TICKS_PER_SECOND
+            words.append((start, start + chunk["duration"] / TICKS_PER_SECOND))
     if not audio:
         raise RuntimeError("audio vide")
-    return bytes(audio), first_word_end
+    return bytes(audio), words
 
 
 def _gtts_audio(text: str) -> bytes:
@@ -547,11 +551,11 @@ def _gtts_audio(text: str) -> bytes:
 
 
 async def speak(text: str, voice: str, rate: str) -> bytes:
-    """MP3 d'un mot ou d'un texte, voyelle finale prononcée si besoin (sans silence final)."""
+    """Version de secours (sans ffmpeg) : MP3 d'un mot, voyelle finale prononcée si besoin."""
     if ends_with_short_vowel(text):
         try:
-            audio, word_end = await _edge_audio(f"{text} {CARRIER_WORD}", voice, rate, word_boundary=True)
-            trimmed = trim_mp3(audio, word_end + CARRIER_MARGIN) if word_end else None
+            audio, bounds = await _edge_audio(f"{text} {CARRIER_WORD}", voice, rate, word_boundary=True)
+            trimmed = trim_mp3(audio, bounds[0][1] + CARRIER_MARGIN) if bounds else None
             if trimmed:
                 return trimmed
             raise RuntimeError("repères de mots absents")
@@ -565,37 +569,207 @@ async def speak(text: str, voice: str, rate: str) -> bytes:
     return await asyncio.to_thread(_gtts_audio, text)
 
 
-def emphasize_long_vowels(word: str, extra: int) -> str:
-    """Texte LU par la voix : chaque voyelle longue est écrite 1 + `extra` fois pour que la
-    voix la tienne plus longtemps (كِتَابْ → كِتَاااابْ). L'écriture affichée ne change pas."""
-    if extra <= 0:
-        return word
-    out: list[str] = []
+# ---------------------------------------------------------------------------
+# Traitement du son (ffmpeg + numpy) : coupe précise, prolongements, silences
+# ---------------------------------------------------------------------------
+#
+# Mode normal : on ÉTIRE le son des voyelles longues directement dans l'audio. Une voyelle
+# est une vibration régulière (une « période » se répète) : on repère le milieu de la
+# voyelle longue, on mesure sa période et on répète quelques périodes. La voyelle dure
+# plus longtemps sans changer de timbre ni de hauteur, et le reste du mot est intact.
+
+SAMPLE_RATE = 24000
+MADD_STRETCH = 0.30   # secondes ajoutées à chaque voyelle longue en mode normal
+FADE = 0.015          # fondu (s) en fin de mot coupé, pour éviter un « clic »
+
+
+def _find_ffmpeg() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg  # ffmpeg fourni par pip (requirements.txt)
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+FFMPEG = _find_ffmpeg()
+
+
+async def _ffmpeg(args: list[str], data: bytes) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG, "-hide_banner", "-v", "error", *args,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(data)
+    if proc.returncode != 0 or not out:
+        raise RuntimeError(f"ffmpeg : {err.decode(errors='ignore')[-200:]}")
+    return out
+
+
+async def decode_pcm(mp3: bytes) -> "np.ndarray":
+    raw = await _ffmpeg(["-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"], mp3)
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+async def encode_pcm(pcm: "np.ndarray") -> tuple[bytes, str]:
+    """PCM → (octets, nom de fichier). MP3 d'abord, sinon OGG/Opus."""
+    raw = (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+    source = ["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0"]
+    for codec, fmt, name in (("libmp3lame", "mp3", "dictee.mp3"), ("libopus", "ogg", "dictee.ogg")):
+        try:
+            return await _ffmpeg(source + ["-c:a", codec, "-b:a", "64k", "-f", fmt, "pipe:1"], raw), name
+        except Exception as exc:
+            logger.warning("Encodage %s impossible (%s)", codec, exc)
+    raise RuntimeError("aucun encodeur audio disponible")
+
+
+def phonetic_units(word: str) -> list[tuple[str, float]]:
+    """Découpe un mot en sons avec une durée relative : consonne « C », voyelle courte « V »,
+    voyelle longue « L » (sert à estimer où tombe chaque voyelle longue dans l'audio)."""
+    units: list[tuple[str, float]] = []
     prev_vowel = None
     for i, ch in enumerate(word):
-        out.append(ch)
         if ch in SHORT_VOWELS:
+            units.append(("V", 0.9))
             prev_vowel = ch
-            continue
-        if ch in MARKS:
-            if ch == SUKUN:
-                prev_vowel = None
-            continue
-        next_is_mark = i + 1 < len(word) and word[i + 1] in MARKS
-        if not next_is_mark and LONG_VOWEL_LETTER.get(prev_vowel) == ch:
-            out.append(ch * extra)  # lettre de prolongation sans signe, après la bonne voyelle
-        prev_vowel = None
-    return "".join(out)
+        elif ch == SHADDA:
+            units.append(("C", 1.0))           # consonne doublée
+        elif ch in MARKS:
+            prev_vowel = None
+        else:
+            has_mark = i + 1 < len(word) and word[i + 1] in MARKS
+            if not has_mark and LONG_VOWEL_LETTER.get(prev_vowel) == ch:
+                units.append(("L", 2.2))
+            else:
+                units.append(("C", 1.0))
+            prev_vowel = None
+    return units
 
 
-async def render_audio(words: list[str], voice: str, rate: str, pause: float, madd_extra: int = 0) -> bytes:
-    """Audio final : un mot, ou une phrase mot par mot avec `pause` secondes entre les mots,
-    puis END_SILENCE secondes de silence. `madd_extra` > 0 appuie sur les voyelles longues."""
-    words = [emphasize_long_vowels(w, madd_extra) for w in words]
+def _periodicity(frame: "np.ndarray") -> tuple[float, int]:
+    """(force de la vibration régulière 0→1, période en échantillons) d'un extrait."""
+    x = frame - frame.mean()
+    energy = float(np.dot(x, x))
+    if energy < 1e-6:
+        return 0.0, 0
+    lo, hi = SAMPLE_RATE // 400, SAMPLE_RATE // 70      # voix entre 70 et 400 Hz
+    spectrum = np.fft.rfft(x, 2 * len(x))
+    ac = np.fft.irfft(spectrum * np.conj(spectrum))[: len(x)]
+    if hi >= len(ac):
+        return 0.0, 0
+    lag = lo + int(np.argmax(ac[lo:hi]))
+    return float(ac[lag] / ac[0]), lag
+
+
+def _best_loop_length(pcm: "np.ndarray", a: int, target: int, period: int) -> int:
+    """Longueur (≈ target) pour laquelle le son se répète le mieux à partir de `a` :
+    les copies s'enchaînent alors sans à-coup."""
+    n = max(period, SAMPLE_RATE // 100)
+    ref = pcm[a: a + n]
+    best_len, best_corr = target, -1.0
+    for length in range(max(period, target - period // 2), target + period // 2 + 1):
+        seg = pcm[a + length: a + length + n]
+        if len(seg) < n or len(ref) < n:
+            break
+        corr = float(np.dot(ref, seg) / (np.linalg.norm(ref) * np.linalg.norm(seg) + 1e-9))
+        if corr > best_corr:
+            best_len, best_corr = length, corr
+    return best_len
+
+
+def stretch_long_vowels(pcm: "np.ndarray", word: str, start: float, end: float,
+                        extra: float = MADD_STRETCH) -> "np.ndarray":
+    """Allonge chaque voyelle longue du mot de `extra` secondes."""
+    units = phonetic_units(word)
+    total = sum(w for _, w in units)
+    if not total or end <= start:
+        return pcm
+    targets = []
+    cumul = 0.0
+    for kind, weight in units:
+        if kind == "L":
+            center = start + (end - start) * (cumul + weight / 2) / total
+            half = (end - start) * weight / total * 0.6
+            targets.append((center, half))
+        cumul += weight
+
+    win = int(0.03 * SAMPLE_RATE)
+    for center, half in reversed(targets):   # de la fin vers le début : les indices restent valables
+        c, h = int(center * SAMPLE_RATE), int(half * SAMPLE_RATE)
+        best, best_score, best_period = None, 0.0, 0
+        for pos in range(max(win, c - h), min(len(pcm) - win, c + h) + 1, SAMPLE_RATE // 200):
+            frame = pcm[pos - win // 2: pos + win // 2]
+            strength, period = _periodicity(frame)
+            closeness = 1.0 - 0.5 * abs(pos - c) / max(h, 1)   # préfère le centre estimé
+            score = strength * float(np.sqrt(np.mean(frame ** 2))) * closeness
+            if strength > 0.5 and score > best_score:
+                best, best_score, best_period = pos, score, period
+        if best is None:
+            continue   # pas de voyelle nette trouvée : on ne touche à rien
+        k = max(1, round(0.03 * SAMPLE_RATE / best_period))
+        block = _best_loop_length(pcm, best - best_period * k // 2, best_period * k, best_period)
+        a = max(block, best - block // 2)
+        # Boucle d'une durée « block » : sa fin est fondue vers le son qui précède `a`,
+        # si bien que chaque copie s'enchaîne sans à-coup avec la suivante… et avec pcm[a].
+        loop = pcm[a: a + block].copy()
+        n = max(8, best_period // 2)
+        ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        loop[-n:] = loop[-n:] * (1 - ramp) + pcm[a - n: a] * ramp
+        reps = max(1, round(extra * SAMPLE_RATE / block))
+        pcm = np.concatenate([pcm[:a], np.tile(loop, reps), pcm[a:]])
+    return pcm
+
+
+async def speak_pcm(word: str, voice: str, rate: str) -> tuple["np.ndarray", float | None, float | None]:
+    """Son d'un mot (PCM) + début et fin du mot, voyelle finale prononcée si besoin."""
+    carrier = ends_with_short_vowel(word)
+    text = f"{word} {CARRIER_WORD}" if carrier else word
+    last_error = None
+    for candidate in dict.fromkeys((voice, DEFAULT_VOICE)):
+        try:
+            mp3, bounds = await _edge_audio(text, candidate, rate, word_boundary=True)
+            pcm = await decode_pcm(mp3)
+            start, end = bounds[0] if bounds else (None, None)
+            if carrier:
+                if end is None:
+                    raise RuntimeError("repères de mots absents")
+                pcm = pcm[: int((end + CARRIER_MARGIN) * SAMPLE_RATE)].copy()
+                n = min(len(pcm), int(FADE * SAMPLE_RATE))
+                pcm[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32)
+            return pcm, start, end
+        except Exception as exc:
+            last_error = exc
+            logger.warning("edge-tts en échec avec %s pour %s (%s)", candidate, word, exc)
+    logger.warning("Repli sur gTTS pour %s (%s)", word, last_error)
+    return await decode_pcm(await asyncio.to_thread(_gtts_audio, word)), None, None
+
+
+async def render_audio_processed(words: list[str], voice: str, rate: str, pause: float,
+                                 stretch: bool) -> tuple[bytes, str]:
+    segments = await asyncio.gather(*(speak_pcm(w, voice, rate) for w in words))
+    parts = []
+    for word, (pcm, start, end) in zip(words, segments):
+        if stretch and start is not None:
+            try:
+                pcm = stretch_long_vowels(pcm, word, start, end)
+            except Exception:
+                logger.exception("Prolongement impossible pour %s", word)
+        parts.append(pcm)
+    gap = np.zeros(int(pause * SAMPLE_RATE), dtype=np.float32)
+    audio = parts[0]
+    for part in parts[1:]:
+        audio = np.concatenate([audio, gap, part])
+    audio = np.concatenate([audio, np.zeros(int(END_SILENCE * SAMPLE_RATE), dtype=np.float32)])
+    return await encode_pcm(audio)
+
+
+async def render_audio_simple(words: list[str], voice: str, rate: str, pause: float) -> bytes:
+    """Version de secours sans ffmpeg : assemblage direct des trames MP3 (pas de prolongement)."""
     segments = await asyncio.gather(*(speak(w, voice, rate) for w in words))
     formats = {mp3_format(s) for s in segments}
     if len(segments) > 1 and (len(formats) != 1 or None in formats):
-        # Formats différents (voix de secours) : on lit la phrase d'un seul bloc.
         segments = [await speak(" ، ".join(words), voice, rate)]
     audio = segments[0]
     for segment in segments[1:]:
@@ -603,14 +777,26 @@ async def render_audio(words: list[str], voice: str, rate: str, pause: float, ma
     return audio + mp3_silence(audio, END_SILENCE)
 
 
+async def render_audio(words: list[str], voice: str, rate: str, pause: float,
+                       stretch: bool = False) -> tuple[bytes, str]:
+    """Audio final : un mot, ou une phrase mot par mot avec `pause` secondes entre les mots,
+    puis END_SILENCE secondes de silence. `stretch` = voyelles longues étirées (mode normal)."""
+    if FFMPEG and np is not None:
+        try:
+            return await render_audio_processed(words, voice, rate, pause, stretch)
+        except Exception:
+            logger.exception("Traitement audio impossible : version simple")
+    return await render_audio_simple(words, voice, rate, pause), "dictee.mp3"
+
+
 async def send_voice_note(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, words: list[str], voice: str, rate: str,
-    pause: float, caption: str, reply_markup: InlineKeyboardMarkup | None = None, madd_extra: int = 0,
+    pause: float, caption: str, reply_markup: InlineKeyboardMarkup | None = None, stretch: bool = False,
 ) -> None:
     await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
-    audio = await render_audio(words, voice, rate, pause, madd_extra)
+    audio, filename = await render_audio(words, voice, rate, pause, stretch)
     await context.bot.send_voice(
-        chat_id, voice=audio, filename="dictee.mp3", caption=caption,
+        chat_id, voice=audio, filename=filename, caption=caption,
         parse_mode=ParseMode.HTML, reply_markup=reply_markup,
     )
 
@@ -639,12 +825,12 @@ def settings_of(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return settings
 
 
-def audio_params(settings: dict, slow: bool = False) -> tuple[str, str, float, int]:
-    """(voix, débit, pause entre les mots, prolongation ajoutée) selon les réglages de l'élève."""
+def audio_params(settings: dict, slow: bool = False) -> tuple[str, str, float, bool]:
+    """(voix, débit, pause entre les mots, voyelles longues étirées ?) selon l'élève."""
     rate = SLOW_REPLAY_RATE if slow else SPEEDS[settings["speed"]][1]
     pause = PAUSES[settings["pause"]][1] * (1.5 if slow else 1)
-    extra = MADD_EXTRA if settings["mode"] == "normal" else 0
-    return settings["voice"], rate, pause, extra
+    stretch = settings["mode"] == "normal"
+    return settings["voice"], rate, pause, stretch
 
 
 def voice_label(voice: str) -> str:
@@ -655,7 +841,6 @@ def settings_summary(settings: dict) -> str:
     def mark(key: str) -> str:
         return "✅" if settings[key] else "❌"
     return (
-        f"{MODES[settings['mode']]}\n"
         f"{mark('long')} voyelles longues   {mark('sukun')} soukoun   "
         f"{mark('shadda')} chadda   {mark('hamza')} hamza\n"
         f"🔊 {voice_label(settings['voice']).split(' —')[0]}, vitesse "
@@ -668,7 +853,6 @@ def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     def toggle(key: str, label: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(f"{'✅' if settings[key] else '❌'} {label}", callback_data=f"O:{key}")
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Mode {MODES[settings['mode']]}", callback_data="O:mode")],
         [toggle("long", "Voyelles longues (ا و ي)")],
         [toggle("sukun", "Soukoun ( ـْ )"), toggle("shadda", "Chadda ( ـّ )")],
         [toggle("hamza", "Hamza (أ إ)")],
@@ -792,8 +976,8 @@ HELP_TEXT = (
     "السَّلَامُ عَلَيْكُم 👋\n\n"
     "Je t'aide à t'entraîner à la <b>dictée en arabe</b>.\n\n"
     "1️⃣ /lettres : coche les lettres que tu as déjà apprises\n"
-    "2️⃣ /reglages : mode normal ou difficile, voyelles longues, soukoun, chadda, hamza, vitesse, pauses\n"
-    "3️⃣ /dictee : dictée de mots ou de phrases, avec uniquement ce que tu as vu\n"
+    "2️⃣ /reglages : voyelles longues, soukoun, chadda, hamza, vitesse, pauses\n"
+    "3️⃣ /dictee : mots ou phrases, niveau normal (prolongements appuyés) ou difficile\n"
     "🎙️ /voix : choisis la voix qui te parle le mieux\n"
     "⏹ /stop : arrête la dictée en cours\n\n"
     "Je te dicte surtout de vrais mots (avec leur traduction), et j'invente des mots "
@@ -965,9 +1149,25 @@ async def on_choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     mode = query.data.split(":", 1)[1]
     unit = "phrases" if mode == "p" else "mots"
+    buttons = [[InlineKeyboardButton(label, callback_data=f"Z:{mode}:{key}")] for key, label in MODES.items()]
+    await safe_edit_text(
+        query,
+        f"📝 <b>Dictée de {unit}</b>\nQuel niveau ?\n\n"
+        "🟢 <b>Normal</b> : la voix fait durer les voyelles longues pour bien les entendre.\n"
+        "🔴 <b>Difficile</b> : voix naturelle, comme une vraie dictée.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def on_choose_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, mode, level = query.data.split(":")
+    settings_of(context)["mode"] = level
+    unit = "phrases" if mode == "p" else "mots"
     buttons = [InlineKeyboardButton(f"{n} {unit if n > 1 else unit[:-1]}", callback_data=f"C:{mode}:{n}")
                for n in SESSION_SIZES[mode]]
-    await safe_edit_text(query, f"📝 <b>Dictée de {unit}</b>\nCombien ?",
+    await safe_edit_text(query, f"📝 <b>Dictée de {unit}</b> — {MODES[level]}\nCombien ?",
                          reply_markup=InlineKeyboardMarkup([buttons]))
 
 
@@ -1021,7 +1221,8 @@ async def on_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     n_real = sum(1 for w in all_words if w["fr"])
     await safe_edit_text(
         query,
-        intro + f"📖 {n_real} vrai(s) mot(s), 🧪 {len(all_words) - n_real} inventé(s)\n"
+        intro + f"{MODES[settings['mode']]}\n"
+        f"📖 {n_real} vrai(s) mot(s), 🧪 {len(all_words) - n_real} inventé(s)\n"
         "Écoute, écris sur ta feuille, puis vérifie.",
     )
     await send_current_item(query.message.chat_id, context)
@@ -1036,7 +1237,7 @@ async def send_current_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
         await send_voice_note(
             context, chat_id, [w["ar"] for w in item], voice, rate, pause,
             f"🎧 <b>{item_label(session, index)}</b> — écoute et écris sur ta feuille.",
-            word_keyboard(session, index, revealed=False), madd_extra=extra,
+            word_keyboard(session, index, revealed=False), stretch=extra,
         )
     except Exception:
         logger.exception("Échec de l'envoi audio pour %s", item_text(item))
@@ -1088,7 +1289,7 @@ async def on_slow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await send_voice_note(
             context, query.message.chat_id, [w["ar"] for w in session["items"][index]], voice, rate, pause,
-            f"🐢 {item_label(session, index)}, au ralenti", madd_extra=extra,
+            f"🐢 {item_label(session, index)}, au ralenti", stretch=extra,
         )
     except Exception:
         logger.exception("Échec de la version lente")
@@ -1190,6 +1391,7 @@ def build_application(token: str, builder=None) -> Application:
     app.add_handler(CallbackQueryHandler(on_setting, pattern=r"^O:\w+$"))
     app.add_handler(CallbackQueryHandler(on_voice, pattern=r"^[VK]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_choose_mode, pattern=r"^M:[wp]$"))
+    app.add_handler(CallbackQueryHandler(on_choose_level, pattern=r"^Z:[wp]:(normal|difficile)$"))
     app.add_handler(CallbackQueryHandler(on_choose_count, pattern=r"^C:[wp]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^G:[wp]:\d+:\w+$"))
     app.add_handler(CallbackQueryHandler(on_reveal, pattern=r"^R:"))
