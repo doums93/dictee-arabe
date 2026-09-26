@@ -1,0 +1,8 @@
+# Remplace COLLE_TON_TOKEN_ICI par le token donné par @BotFather (sans espace ni guillemets)
+TELEGRAM_BOT_TOKEN=COLLE_TON_TOKEN_ICI
+
+# Réglages optionnels
+# Voix masculine : ar-SA-HamedNeural   |   voix féminine : ar-SA-ZariyahNeural
+TTS_VOICE=ar-SA-HamedNeural
+# Vitesse : -20% = ralenti (conseillé pour une dictée), +0% = normal
+TTS_RATE=-20%
