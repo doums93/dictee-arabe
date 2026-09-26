@@ -2,32 +2,38 @@
 Bot Telegram — Dictée en arabe pour débutants.
 
 Principe :
-  1. /lettres  → l'élève coche les lettres qu'il a déjà apprises.
-  2. /dictee   → il choisit le nombre de mots puis leur longueur.
-  3. Le bot INVENTE des mots au hasard (ils n'ont pas besoin d'avoir un sens),
-     construits uniquement avec les lettres cochées, entièrement vocalisés.
-  4. Il envoie chaque mot en note vocale, sans l'écriture.
-  5. « 👁️ Afficher la réponse » révèle le mot écrit avec ses harakât.
-  6. « ➡️ Mot suivant » enchaîne ; à la fin, un bilan récapitule la série.
+  1. /lettres   → l'élève coche les lettres qu'il a déjà apprises.
+  2. /reglages  → il choisit ce qu'il a déjà vu : voyelles longues, soukoun, chadda,
+                  hamza, ainsi que la vitesse et la voix (/voix).
+  3. /dictee    → nombre de mots, longueur, puis c'est parti.
+     Le bot pioche d'abord de VRAIS mots (mots.json, avec traduction) qui ne
+     contiennent que les lettres et les signes autorisés, et complète avec des
+     mots INVENTÉS (signalés comme tels) : la réserve de mots est infinie.
+  4. Chaque mot est envoyé en note vocale, sans l'écriture.
+     « 👁️ Afficher la réponse » révèle le mot vocalisé (+ traduction ou « mot inventé »).
+     « 🐢 Plus lentement » renvoie le même mot au ralenti.
+  5. À la fin, un bilan récapitule la série.
 
 Choix techniques :
-  - python-telegram-bot v21/v22 (async).
-  - Synthèse vocale : edge-tts (voix neuronales Microsoft, gratuites, bien plus
-    claires que gTTS en arabe), avec repli automatique sur gTTS en cas d'échec.
-  - Chaque audio est écrit dans un fichier temporaire, envoyé, puis supprimé.
-  - PicklePersistence : les lettres de chaque élève survivent au redémarrage du bot.
+  - python-telegram-bot v22 (async).
+  - Synthèse vocale : edge-tts (voix neuronales Microsoft, gratuites), repli sur gTTS.
+  - Audios écrits dans des fichiers temporaires, supprimés juste après l'envoi.
+  - PicklePersistence : lettres et réglages de chaque élève conservés au redémarrage
+    (sur Railway, attacher un volume pour les garder aussi lors des mises à jour).
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import random
 import re
 import secrets
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import edge_tts
@@ -49,45 +55,72 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / "config.txt")  # contient TELEGRAM_BOT_TOKEN=... (et réglages optionnels)
-# Sur le serveur, le token est écrit dans config.local.txt (jamais envoyé sur GitHub).
+load_dotenv(BASE_DIR / "config.txt")  # TELEGRAM_BOT_TOKEN=... (et réglages optionnels)
+# Sur un serveur, le token peut être écrit dans config.local.txt (jamais envoyé sur GitHub).
 load_dotenv(BASE_DIR / "config.local.txt", override=True)
 
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR))  # le serveur utilise /var/lib/dictee
+# Dossier des données : DATA_DIR, sinon le volume Railway s'il existe, sinon le dossier du bot.
+DATA_DIR = Path(os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or BASE_DIR)
 AUDIO_TMP_DIR = DATA_DIR / "audio_tmp"            # fichiers audio temporaires
-PERSISTENCE_FILE = DATA_DIR / "bot_data.pickle"   # lettres enregistrées de chaque élève
+PERSISTENCE_FILE = DATA_DIR / "bot_data.pickle"   # lettres et réglages de chaque élève
+WORDS_FILE = BASE_DIR / "mots.json"               # banque de vrais mots vocalisés
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TTS_VOICE = os.getenv("TTS_VOICE", "ar-SA-HamedNeural")  # ou ar-SA-ZariyahNeural (voix féminine)
-TTS_RATE = os.getenv("TTS_RATE", "-20%")                 # débit ralenti pour la dictée
+DEFAULT_VOICE = os.getenv("TTS_VOICE", "ar-SA-HamedNeural")
+
+# Voix masculines proposées dans /voix (identifiant edge-tts, nom affiché).
+VOICES = [
+    ("ar-SA-HamedNeural", "Hamed — Arabie saoudite"),
+    ("ar-EG-ShakirNeural", "Shakir — Égypte"),
+    ("ar-AE-HamdanNeural", "Hamdan — Émirats"),
+    ("ar-JO-TaimNeural", "Taim — Jordanie"),
+    ("ar-KW-FahedNeural", "Fahed — Koweït"),
+    ("ar-QA-MoazNeural", "Moaz — Qatar"),
+]
+VOICE_SAMPLE = "بَابْ ، كِتَابْ ، قَلَمْ ، شَمْسْ"
+
+# Vitesses proposées dans /reglages (clé : libellé, débit edge-tts).
+SPEEDS = {
+    "normale": ("Normale", "+0%"),
+    "lente": ("Lente", "-20%"),
+    "tres_lente": ("Très lente", "-40%"),
+}
+SLOW_REPLAY_RATE = "-50%"   # bouton « 🐢 Plus lentement »
+
+# Réglages par défaut d'un nouvel élève.
+DEFAULT_SETTINGS = {
+    "long": True,      # voyelles longues (ا و ي)
+    "sukun": False,    # soukoun ( ْ )
+    "shadda": False,   # chadda ( ّ )
+    "hamza": False,    # hamza sur alif (أ إ)
+    "speed": "lente",
+    "voice": DEFAULT_VOICE,
+}
 
 SESSION_SIZES = (3, 5, 10)
 MIN_LETTERS = 2
 LETTERS_PER_ROW = 4
+REAL_WORD_RATIO = 0.7   # part de vrais mots dans une dictée (le reste est inventé)
+RECENT_REAL_MAX = 80    # vrais mots mémorisés pour éviter de les redonner trop vite
 
-# Longueur des mots inventés, en nombre de syllabes (min, max).
+# Longueur des mots, en nombre de syllabes (min, max).
 WORD_LENGTHS = {
     "court": ("Courts", (1, 2)),
     "moyen": ("Moyens", (2, 3)),
     "long": ("Longs", (3, 4)),
 }
 
-# Autoriser un alif avec hamza en début de mot (أَ / أُ / إِ) quand ا est cochée.
-# Passe à False si la hamza n'a pas encore été vue en cours.
-ALLOW_INITIAL_HAMZA = True
-
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)  # évite le bruit des requêtes HTTP
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("dictee_arabe")
 
 # ---------------------------------------------------------------------------
-# Alphabet
+# Alphabet et signes
 # ---------------------------------------------------------------------------
 
-# Les 28 lettres, dans l'ordre alphabétique classique.
 ALPHABET = [
     "ا", "ب", "ت", "ث", "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص",
     "ض", "ط", "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "ه", "و", "ي",
@@ -97,11 +130,12 @@ ALPHABET_SET = frozenset(ALPHABET)
 FATHA, DAMMA, KASRA = "\u064E", "\u064F", "\u0650"   # a, ou, i
 SUKUN, SHADDA = "\u0652", "\u0651"
 SHORT_VOWELS = (FATHA, DAMMA, KASRA)
-LONG_VOWEL_LETTER = {FATHA: "ا", DAMMA: "و", KASRA: "ي"}  # voyelles longues : aa, ouu, ii
+MARKS = frozenset(SHORT_VOWELS + (SUKUN, SHADDA))
+LONG_VOWEL_LETTER = {FATHA: "ا", DAMMA: "و", KASRA: "ي"}  # aa, ouu, ii
 SEMI_VOWELS = ("و", "ي")
+HAMZA_ALIFS = ("أ", "إ")
 
 DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670]")
-HAMZA_TO_ALIF = {"أ": "ا", "إ": "ا"}
 
 
 def ordered(letters: set[str]) -> list[str]:
@@ -110,137 +144,283 @@ def ordered(letters: set[str]) -> list[str]:
 
 
 def consonants_of(letters: set[str]) -> list[str]:
-    """Lettres utilisables comme consonnes (toutes sauf l'alif, qui ne porte pas de voyelle)."""
+    """Lettres utilisables comme consonnes (toutes sauf l'alif)."""
     return [letter for letter in ordered(letters) if letter != "ا"]
 
 
 def spelled_letters(word: str) -> str:
-    """بَابْ → « ب · ا · ب » : aide le débutant à vérifier lettre par lettre."""
-    bare = DIACRITICS_RE.sub("", word)
-    return " · ".join(bare)
+    """بَابْ → « ب · ا · ب » : aide à vérifier lettre par lettre."""
+    return " · ".join(DIACRITICS_RE.sub("", word))
 
 
-def base_letters(word: str) -> set[str]:
-    """Lettres de base d'un mot (hamza rattachée à l'alif), pour les contrôles."""
-    return {HAMZA_TO_ALIF.get(ch, ch) for ch in DIACRITICS_RE.sub("", word)}
+# ---------------------------------------------------------------------------
+# Analyse d'un mot vocalisé
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WordInfo:
+    arabic: str
+    french: str | None          # None = mot inventé
+    consonants: frozenset[str]  # lettres portant une voyelle, un soukoun ou une chadda
+    madd: bool                  # contient une voyelle longue
+    sukun: bool
+    shadda: bool
+    hamza: bool                 # contient أ ou إ
+    syllables: int              # nombre de voyelles courtes
+
+
+def analyze_word(word: str, french: str | None = None) -> WordInfo:
+    """Décompose un mot entièrement vocalisé et vérifie qu'il est bien écrit.
+
+    Lève ValueError si le mot contient un caractère non géré (ة, ى, ء, tanwîn…),
+    une lettre sans signe, ou une voyelle longue mal placée.
+    """
+    units: list[tuple[str, set[str]]] = []
+    for ch in word:
+        if ch in MARKS:
+            if not units:
+                raise ValueError("signe sans lettre")
+            units[-1][1].add(ch)
+        elif ch in ALPHABET_SET or ch in HAMZA_ALIFS:
+            units.append((ch, set()))
+        else:
+            raise ValueError(f"caractère non géré : {ch!r}")
+    if not units:
+        raise ValueError("mot vide")
+
+    consonants: set[str] = set()
+    madd = sukun = shadda = hamza = False
+    syllables = 0
+    prev_vowel: str | None = None
+
+    for letter, marks in units:
+        vowels = marks & set(SHORT_VOWELS)
+        if len(vowels) > 1:
+            raise ValueError("deux voyelles sur une lettre")
+        vowel = next(iter(vowels), None)
+
+        if letter in HAMZA_ALIFS:
+            if not marks:
+                raise ValueError("hamza sans signe")
+            hamza = True
+        elif letter == "ا":
+            if marks:
+                raise ValueError("alif avec un signe (hamzat al-wasl non géré)")
+            if prev_vowel != FATHA:
+                raise ValueError("alif de prolongation sans fatha avant")
+            madd = True
+            prev_vowel = None
+            continue
+        elif letter in SEMI_VOWELS and not marks:
+            expected = DAMMA if letter == "و" else KASRA
+            if prev_vowel != expected:
+                raise ValueError(f"{letter} sans signe et sans la bonne voyelle avant")
+            madd = True
+            prev_vowel = None
+            continue
+        elif not marks:
+            raise ValueError(f"lettre {letter} sans signe")
+        else:
+            consonants.add(letter)
+
+        sukun |= SUKUN in marks
+        shadda |= SHADDA in marks
+        if vowel:
+            syllables += 1
+        prev_vowel = vowel
+
+    return WordInfo(word, french, frozenset(consonants), madd, sukun, shadda, hamza, syllables)
+
+
+def is_allowed(info: WordInfo, letters: set[str], settings: dict) -> bool:
+    """Le mot ne contient-il que des lettres et des signes déjà vus ?"""
+    if not info.consonants <= letters:
+        return False
+    if info.madd and not settings["long"]:
+        return False
+    if info.sukun and not settings["sukun"]:
+        return False
+    if info.shadda and not settings["shadda"]:
+        return False
+    if info.hamza and not (settings["hamza"] and "ا" in letters):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Banque de vrais mots
+# ---------------------------------------------------------------------------
+
+REAL_WORDS: list[WordInfo] = []
+
+
+def load_word_bank(path: Path) -> list[WordInfo]:
+    """Charge mots.json ; les mots mal écrits sont signalés dans les logs et ignorés."""
+    if not path.exists():
+        logger.warning("%s introuvable : seuls des mots inventés seront proposés", path.name)
+        return []
+    bank: list[WordInfo] = []
+    seen: set[str] = set()
+    for entry in json.loads(path.read_text(encoding="utf-8")):
+        arabic, french = entry["mot"].strip(), entry.get("fr", "").strip()
+        if arabic in seen:
+            continue
+        try:
+            bank.append(analyze_word(arabic, french or "—"))
+            seen.add(arabic)
+        except ValueError as exc:
+            logger.warning("Mot ignoré dans %s : %s (%s)", path.name, arabic, exc)
+    logger.info("%d vrais mots chargés depuis %s", len(bank), path.name)
+    return bank
+
+
+def eligible_real_words(letters: set[str], settings: dict, length_key: str) -> list[WordInfo]:
+    lo, hi = WORD_LENGTHS[length_key][1]
+    return [
+        w for w in REAL_WORDS
+        if is_allowed(w, letters, settings) and lo <= max(w.syllables, 1) <= hi
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Générateur de mots inventés
 # ---------------------------------------------------------------------------
 #
-# Un mot est une suite de syllabes. Chaque syllabe =
-#   consonne d'attaque (+ chadda éventuelle) + voyelle courte
-#   + éventuellement une voyelle longue (ا / و / ي)
-#   + éventuellement une consonne finale avec soukoun.
-#
-# Règles appliquées pour que le mot soit prononçable et lisible par un débutant :
-#   - Seules les lettres cochées sont utilisées.
-#   - Le mot se termine toujours par une consonne avec soukoun ou une voyelle longue
-#     (c'est ainsi qu'on prononce un mot isolé : l'audio correspond à l'écrit).
-#   - و / ي en fin de syllabe seulement après fatha (diphtongues « aw », « ay »).
-#   - Pas deux voyelles longues ou deux soukoun qui se suivent.
-#   - La chadda (lettre doublée) n'apparaît qu'en milieu de mot.
+# Un mot = une suite de syllabes : consonne (+ chadda) + voyelle courte
+#   (+ voyelle longue) (+ consonne finale avec soukoun).
+# Règles :
+#   - seules les lettres cochées servent de consonnes ;
+#   - voyelles longues : ا و ي sont utilisées dès que l'option est active,
+#     et chaque mot en contient au moins une ;
+#   - soukoun, chadda, hamza : uniquement si l'option est active ;
+#   - avec le soukoun, le mot se termine par une consonne + soukoun ou une voyelle
+#     longue (prononciation d'un mot isolé) ;
+#   - و / ي avec soukoun seulement après une fatha (« aw », « ay ») ;
+#   - « بْب » est toujours écrit « بّ ».
 
 def _pick(options: list[str], avoid: set[str]) -> str:
-    """Choisit au hasard en évitant certaines lettres si c'est possible."""
     preferred = [o for o in options if o not in avoid]
     return random.choice(preferred or options)
 
 
-def generate_word(letters: set[str], syllables: int) -> str:
+def generate_word(letters: set[str], syllables: int, settings: dict) -> str:
     consonants = consonants_of(letters)
     if not consonants:
         raise ValueError("Il faut au moins une lettre autre que ا")
+    long_ok, sukun_ok = settings["long"], settings["sukun"]
+    shadda_ok = settings["shadda"]
+    hamza_ok = settings["hamza"] and "ا" in letters
 
+    forced_long = random.randrange(syllables) if long_ok else None
     parts: list[str] = []
-    avoid_next: set[str] = set()   # lettres à éviter en début de syllabe suivante
-    geminate_next = False           # la prochaine attaque porte une chadda
-    prev_coda: str | None = None    # consonne finale (avec soukoun) de la syllabe précédente
+    avoid_next: set[str] = set()
+    geminate_next = False
+    prev_coda: str | None = None
 
     for i in range(syllables):
         is_first, is_last = i == 0, i == syllables - 1
-        vowel = random.choice(SHORT_VOWELS)
 
-        # 1) Attaque : consonne, ou alif-hamza en tout début de mot.
-        use_hamza = (
-            is_first and ALLOW_INITIAL_HAMZA and "ا" in letters and random.random() < 0.2
-        )
-        if use_hamza:
-            onset = "إ" if vowel == KASRA else "أ"
-        else:
+        # 1) Attaque : alif-hamza (début de mot) ou consonne.
+        use_hamza = is_first and hamza_ok and random.random() < 0.2
+        onset = None
+        if not use_hamza:
             onset = _pick(consonants, avoid_next)
             if onset == prev_coda:
-                # « بْب » s'écrit « بّ » : on retire le soukoun et on met une chadda.
-                parts.pop()
-                geminate_next = True
-        shadda = SHADDA if geminate_next else ""
-        parts.append(onset + shadda + vowel)
-        had_shadda, geminate_next = geminate_next, False
+                parts.pop()  # retire « consonne + soukoun » de la syllabe précédente
+                if shadda_ok:
+                    geminate_next = True      # « بْب » → « بّ »
+        had_shadda = geminate_next
 
-        # 2) Voyelle longue ?  (أَا s'écrirait آ : on l'évite)
+        # 2) Voyelle courte, puis voyelle longue éventuelle.
+        want_long = long_ok and (i == forced_long or random.random() < 0.3)
+        vowel_choices = list(SHORT_VOWELS)
+        if want_long:
+            vowel_choices = [
+                v for v in SHORT_VOWELS
+                if not (use_hamza and v == FATHA)  # أَا s'écrirait آ
+                # « وُو » suivi d'un autre و serait illisible
+                and not (not is_last and set(consonants) <= {LONG_VOWEL_LETTER[v]})
+            ]
+            if not vowel_choices:
+                want_long, vowel_choices = False, list(SHORT_VOWELS)
+        vowel = random.choice(vowel_choices)
+
+        if use_hamza:
+            onset = "إ" if vowel == KASRA else "أ"
+        parts.append(onset + (SHADDA if geminate_next else "") + vowel)
+        geminate_next = False
+
         long_letter = LONG_VOWEL_LETTER[vowel]
-        is_long = (
-            long_letter in letters
-            and random.random() < 0.35
-            and not (use_hamza and vowel == FATHA)
-            # « وُو » suivi d'un autre و serait illisible : pas de voyelle longue
-            # au milieu du mot si cette lettre est la seule consonne disponible.
-            and not (not is_last and set(consonants) <= {long_letter})
-        )
-        if is_long:
+        if want_long:
             parts.append(long_letter)
 
         # 3) Consonne finale avec soukoun ?
-        if is_last:
-            wants_coda = (not is_long) or random.random() < 0.5
-        else:
-            # Avec une seule consonne, une finale en milieu de mot devient toujours
-            # une chadda (بْب → بّ) : on la rend plus rare pour ne pas en abuser.
-            coda_rate = 0.35 if len(consonants) > 1 else 0.1
-            wants_coda = (not is_long) and random.random() < coda_rate
-
         coda = None
-        if wants_coda:
-            allowed = [c for c in consonants if c not in SEMI_VOWELS or (vowel == FATHA and not is_long)]
-            if not allowed and is_last and not is_long:
-                # Seules و/ي sont disponibles : on force la fatha → diphtongue « aw » / « ay ».
-                vowel = FATHA
-                parts[-1] = parts[-1][:-1].replace("إ", "أ") + FATHA
-                allowed = list(consonants)
-            if allowed:
-                coda = random.choice(allowed)
-                parts.append(coda + SUKUN)
+        if sukun_ok:
+            if is_last:
+                wants_coda = (not want_long) or random.random() < 0.5
+            else:
+                rate = 0.35 if len(consonants) > 1 else 0.1
+                wants_coda = (not want_long) and random.random() < rate
+            if wants_coda:
+                allowed = [
+                    c for c in consonants
+                    if c not in SEMI_VOWELS or (vowel == FATHA and not want_long)
+                ]
+                if not allowed and is_last and not want_long:
+                    # Seules و/ي sont disponibles : fatha forcée → « aw » / « ay ».
+                    vowel = FATHA
+                    parts[-1] = parts[-1][:-1].replace("إ", "أ") + FATHA
+                    allowed = list(consonants)
+                if allowed:
+                    coda = random.choice(allowed)
+                    parts.append(coda + SUKUN)
 
         # 4) Préparer la syllabe suivante.
         prev_coda = coda
-        avoid_next = {coda} if coda else ({long_letter} if is_long else set())
-        if (not is_last and not is_long and coda is None and not had_shadda
-                and random.random() < 0.15):
+        avoid_next = {coda} if coda else ({long_letter} if want_long else set())
+        gem_rate = 0.15 if sukun_ok else 0.25
+        if (shadda_ok and not is_last and not want_long and coda is None
+                and not had_shadda and random.random() < gem_rate):
             geminate_next = True
 
     return "".join(parts)
 
 
-def generate_session_words(letters: set[str], count: int, length_key: str) -> list[str]:
-    """Génère `count` mots différents (si possible) pour une série."""
+def invented_word(letters: set[str], length_key: str, settings: dict) -> WordInfo:
     lo, hi = WORD_LENGTHS[length_key][1]
-    words: list[str] = []
-    for _ in range(count):
-        for _attempt in range(40):
-            word = generate_word(letters, random.randint(lo, hi))
-            if word not in words:
+    return analyze_word(generate_word(letters, random.randint(lo, hi), settings))
+
+
+def build_session_words(
+    letters: set[str], settings: dict, count: int, length_key: str, recent: list[str]
+) -> list[dict]:
+    """Mélange de vrais mots (priorité aux moins récents) et de mots inventés."""
+    pool = eligible_real_words(letters, settings, length_key)
+    random.shuffle(pool)
+    pool.sort(key=lambda w: w.arabic in recent)  # les mots non vus récemment d'abord
+    n_real = min(len(pool), round(count * REAL_WORD_RATIO))
+    chosen = pool[:n_real]
+
+    taken = {w.arabic for w in chosen}
+    while len(chosen) < count:
+        for _ in range(40):
+            word = invented_word(letters, length_key, settings)
+            if word.arabic not in taken:
                 break
-        words.append(word)
-    return words
+        taken.add(word.arabic)
+        chosen.append(word)
+
+    random.shuffle(chosen)
+    return [{"ar": w.arabic, "fr": w.french} for w in chosen]
 
 
 # ---------------------------------------------------------------------------
 # Synthèse vocale (fichiers temporaires)
 # ---------------------------------------------------------------------------
 
-async def _synthesize_edge(text: str, dest: Path) -> None:
-    communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
+async def _synthesize_edge(text: str, voice: str, rate: str, dest: Path) -> None:
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
     await communicate.save(str(dest))
     if not dest.exists() or dest.stat().st_size == 0:
         raise RuntimeError("fichier audio vide")
@@ -250,16 +430,22 @@ def _synthesize_gtts(text: str, dest: Path) -> None:
     gTTS(text=text, lang="ar", slow=True).save(str(dest))
 
 
-async def synthesize(text: str) -> Path:
+async def synthesize(text: str, voice: str, rate: str) -> Path:
     """Crée un MP3 temporaire prononçant `text`. L'appelant doit le supprimer."""
     fd, name = tempfile.mkstemp(suffix=".mp3", dir=AUDIO_TMP_DIR)
     os.close(fd)
     path = Path(name)
     try:
         try:
-            await _synthesize_edge(text, path)
-        except Exception as exc:  # réseau, service indisponible…
-            logger.warning("edge-tts en échec (%s) → repli sur gTTS", exc)
+            await _synthesize_edge(text, voice, rate, path)
+        except Exception as exc:
+            logger.warning("edge-tts en échec avec %s (%s)", voice, exc)
+            if voice != DEFAULT_VOICE:
+                try:
+                    await _synthesize_edge(text, DEFAULT_VOICE, rate, path)
+                    return path
+                except Exception:
+                    pass
             await asyncio.to_thread(_synthesize_gtts, text, path)
         return path
     except Exception:
@@ -267,18 +453,88 @@ async def synthesize(text: str) -> Path:
         raise
 
 
+async def send_voice_note(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, voice: str, rate: str,
+    caption: str, reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+    path = await synthesize(text, voice, rate)
+    try:
+        with path.open("rb") as audio:
+            await context.bot.send_voice(
+                chat_id, voice=audio, caption=caption,
+                parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+            )
+    finally:
+        path.unlink(missing_ok=True)  # nettoyage du fichier temporaire
+
+
 def clean_temp_audio() -> None:
-    """Supprime les fichiers audio laissés par un arrêt brutal du bot."""
     for leftover in AUDIO_TMP_DIR.glob("*.mp3"):
         leftover.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Claviers & textes
+# Réglages de l'élève
+# ---------------------------------------------------------------------------
+
+def settings_of(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    settings = context.user_data.setdefault("settings", {})
+    for key, value in DEFAULT_SETTINGS.items():
+        settings.setdefault(key, value)
+    if settings["voice"] not in {v for v, _ in VOICES}:
+        settings["voice"] = DEFAULT_VOICE
+    return settings
+
+
+def voice_label(voice: str) -> str:
+    return next((label for v, label in VOICES if v == voice), voice)
+
+
+def settings_summary(settings: dict) -> str:
+    def mark(key: str) -> str:
+        return "✅" if settings[key] else "❌"
+    return (
+        f"{mark('long')} voyelles longues   {mark('sukun')} soukoun   "
+        f"{mark('shadda')} chadda   {mark('hamza')} hamza\n"
+        f"🔊 {voice_label(settings['voice']).split(' —')[0]}, vitesse "
+        f"{SPEEDS[settings['speed']][0].lower()}"
+    )
+
+
+def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    def toggle(key: str, label: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(f"{'✅' if settings[key] else '❌'} {label}", callback_data=f"O:{key}")
+    return InlineKeyboardMarkup([
+        [toggle("long", "Voyelles longues (ا و ي)")],
+        [toggle("sukun", "Soukoun ( ـْ )"), toggle("shadda", "Chadda ( ـّ )")],
+        [toggle("hamza", "Hamza (أ إ)")],
+        [InlineKeyboardButton(f"🐢 Vitesse : {SPEEDS[settings['speed']][0]}", callback_data="O:speed")],
+        [InlineKeyboardButton(f"🎙️ Voix : {voice_label(settings['voice'])}", callback_data="O:voice")],
+    ])
+
+
+SETTINGS_TEXT = (
+    "⚙️ <b>Réglages de ta dictée</b>\n"
+    "Touche une option pour l'activer ✅ ou la désactiver ❌.\n"
+    "Active seulement ce que tu as déjà vu en cours."
+)
+
+
+def voices_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(("✅ " if v == current else "▶️ ") + label, callback_data=f"V:{i}")]
+        for i, (v, label) in enumerate(VOICES)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# Claviers et textes communs
 # ---------------------------------------------------------------------------
 
 def letters_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
-    """Grille des 28 lettres, 4 par ligne, lue de droite à gauche comme l'arabe."""
+    """Grille des 28 lettres, 4 par ligne, lue de droite à gauche."""
     rows: list[list[InlineKeyboardButton]] = []
     for start in range(0, len(ALPHABET), LETTERS_PER_ROW):
         row = []
@@ -286,7 +542,7 @@ def letters_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
             letter = ALPHABET[i]
             label = f"✅ {letter}" if letter in selected else letter
             row.append(InlineKeyboardButton(label, callback_data=f"L:{i}"))
-        rows.append(list(reversed(row)))  # ا en haut à droite
+        rows.append(list(reversed(row)))
     rows.append([
         InlineKeyboardButton("Tout sélectionner", callback_data="L:ALL"),
         InlineKeyboardButton("Tout réinitialiser", callback_data="L:RESET"),
@@ -303,12 +559,15 @@ def letters_text(selected: set[str]) -> str:
     )
 
 
-def word_caption(index: int, total: int) -> str:
-    return f"🎧 <b>Mot {index + 1}/{total}</b> — écoute et écris-le sur ta feuille."
+def letters_problem(letters: set[str]) -> str | None:
+    if len(letters) < MIN_LETTERS:
+        return f"⚠️ Sélectionne au moins {MIN_LETTERS} lettres avec /lettres avant de lancer une dictée."
+    if not consonants_of(letters):
+        return "⚠️ Coche au moins une lettre en plus de ا avec /lettres."
+    return None
 
 
 async def safe_edit_text(query, text: str, reply_markup=None) -> None:
-    """edit_message_text qui ignore l'erreur « message is not modified »."""
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     except BadRequest as exc:
@@ -316,13 +575,24 @@ async def safe_edit_text(query, text: str, reply_markup=None) -> None:
             raise
 
 
-def letters_problem(letters: set[str]) -> str | None:
-    """Renvoie un message d'erreur si la sélection ne permet pas de dictée."""
-    if len(letters) < MIN_LETTERS:
-        return f"⚠️ Sélectionne au moins {MIN_LETTERS} lettres avec /lettres avant de lancer une dictée."
-    if not consonants_of(letters):
-        return "⚠️ Coche au moins une lettre en plus de ا avec /lettres."
-    return None
+def word_keyboard(session: dict, index: int, revealed: bool) -> InlineKeyboardMarkup:
+    sid = session["id"]
+    is_last = index == len(session["words"]) - 1
+    first = (
+        InlineKeyboardButton("🏁 Voir le bilan" if is_last else "➡️ Mot suivant", callback_data=f"N:{sid}:{index}")
+        if revealed
+        else InlineKeyboardButton("👁️ Afficher la réponse", callback_data=f"R:{sid}:{index}")
+    )
+    return InlineKeyboardMarkup([
+        [first],
+        [InlineKeyboardButton("🐢 Réécouter plus lentement", callback_data=f"S:{sid}:{index}")],
+    ])
+
+
+def meaning_line(word: dict) -> str:
+    if word["fr"]:
+        return f"🇫🇷 {html.escape(word['fr'])}"
+    return "🧪 <i>Mot inventé (pas de sens), juste pour l'entraînement</i>"
 
 
 # ---------------------------------------------------------------------------
@@ -332,12 +602,13 @@ def letters_problem(letters: set[str]) -> str | None:
 HELP_TEXT = (
     "السَّلَامُ عَلَيْكُم 👋\n\n"
     "Je t'aide à t'entraîner à la <b>dictée en arabe</b>.\n\n"
-    "1️⃣ /lettres — coche les lettres que tu as déjà apprises\n"
-    "2️⃣ /dictee — je t'invente des mots avec uniquement ces lettres\n"
-    "⏹ /stop — arrête la dictée en cours\n\n"
-    "Pour chaque mot : écoute la note vocale, écris le mot, puis touche "
-    "« 👁️ Afficher la réponse » pour te corriger.\n"
-    "ℹ️ Les mots sont inventés : ils n'ont pas forcément de sens, c'est normal !"
+    "1️⃣ /lettres : coche les lettres que tu as déjà apprises\n"
+    "2️⃣ /reglages : voyelles longues, soukoun, chadda, hamza, vitesse\n"
+    "3️⃣ /dictee : lance une dictée avec uniquement ce que tu as vu\n"
+    "🎙️ /voix : choisis la voix qui te parle le mieux\n"
+    "⏹ /stop : arrête la dictée en cours\n\n"
+    "Je te dicte surtout de vrais mots (avec leur traduction), et j'invente des mots "
+    "quand il n'en existe pas assez avec tes lettres : ils sont signalés 🧪."
 )
 
 
@@ -346,11 +617,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_letters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Brouillon : rien n'est pris en compte tant que l'élève n'a pas enregistré.
     draft = set(context.user_data.get("letters", set()))
     context.user_data["draft_letters"] = draft
     await update.effective_message.reply_text(
         letters_text(draft), parse_mode=ParseMode.HTML, reply_markup=letters_keyboard(draft)
+    )
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_of(context)
+    await update.effective_message.reply_text(
+        SETTINGS_TEXT, parse_mode=ParseMode.HTML, reply_markup=settings_keyboard(settings)
+    )
+
+
+async def cmd_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_voices_menu(update.effective_chat.id, context)
+
+
+async def send_voices_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_of(context)
+    await context.bot.send_message(
+        chat_id,
+        "🎙️ <b>Choix de la voix</b>\n"
+        "Touche une voix pour l'écouter, puis garde celle que tu comprends le mieux.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=voices_keyboard(settings["voice"]),
     )
 
 
@@ -366,7 +658,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /lettres — boutons
+# /lettres, /reglages, /voix — boutons
 # ---------------------------------------------------------------------------
 
 async def on_letters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -380,11 +672,12 @@ async def on_letters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context.user_data["letters"] = set(draft)
         await query.answer("Sélection enregistrée ✅")
         letters_line = " ".join(ordered(draft)) or "aucune"
-        problem = letters_problem(draft)
-        next_step = problem or "Lance /dictee quand tu es prêt."
+        next_step = letters_problem(draft) or "Lance /dictee quand tu es prêt."
         await safe_edit_text(
             query,
-            f"💾 <b>{len(draft)} lettre(s) enregistrée(s)</b>\n{letters_line}\n\n{next_step}",
+            f"💾 <b>{len(draft)} lettre(s) enregistrée(s)</b>\n{letters_line}\n\n"
+            "ℹ️ Les voyelles longues (ا و ي) sont utilisées automatiquement si elles "
+            "sont activées dans /reglages.\n\n" + next_step,
         )
         return
 
@@ -394,13 +687,63 @@ async def on_letters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         draft.clear()
     else:
         letter = ALPHABET[int(action)]
-        if letter in draft:
-            draft.discard(letter)
-        else:
-            draft.add(letter)
+        draft.symmetric_difference_update({letter})
 
     await query.answer()
     await safe_edit_text(query, letters_text(draft), reply_markup=letters_keyboard(draft))
+
+
+async def on_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    key = query.data.split(":", 1)[1]
+    settings = settings_of(context)
+
+    if key == "voice":
+        await query.answer()
+        await send_voices_menu(query.message.chat_id, context)
+        return
+    if key == "speed":
+        order = list(SPEEDS)
+        settings["speed"] = order[(order.index(settings["speed"]) + 1) % len(order)]
+    elif key in ("long", "sukun", "shadda", "hamza"):
+        settings[key] = not settings[key]
+    await query.answer("Réglage enregistré ✅")
+    await safe_edit_text(query, SETTINGS_TEXT, reply_markup=settings_keyboard(settings))
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """V:i → écouter un échantillon ; K:i → garder cette voix."""
+    query = update.callback_query
+    action, raw = query.data.split(":")
+    index = int(raw)
+    if not 0 <= index < len(VOICES):
+        await query.answer()
+        return
+    voice, label = VOICES[index]
+    settings = settings_of(context)
+
+    if action == "K":
+        settings["voice"] = voice
+        await query.answer("Voix enregistrée ✅")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        await context.bot.send_message(
+            query.message.chat_id, f"✅ Voix choisie : <b>{html.escape(label)}</b>", parse_mode=ParseMode.HTML
+        )
+        return
+
+    await query.answer("Écoute l'exemple 🎧")
+    keep_kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Garder cette voix", callback_data=f"K:{index}")]])
+    try:
+        await send_voice_note(
+            context, query.message.chat_id, VOICE_SAMPLE, voice, SPEEDS[settings["speed"]][1],
+            f"🎙️ <b>{html.escape(label)}</b>\n{VOICE_SAMPLE}", keep_kb,
+        )
+    except Exception:
+        logger.exception("Échantillon impossible pour %s", voice)
+        await context.bot.send_message(query.message.chat_id, "❌ Cette voix est indisponible pour le moment.")
 
 
 # ---------------------------------------------------------------------------
@@ -413,12 +756,13 @@ async def send_dictation_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) 
     if problem:
         await context.bot.send_message(chat_id, problem)
         return
-
     buttons = [InlineKeyboardButton(f"{n} mots", callback_data=f"C:{n}") for n in SESSION_SIZES]
     await context.bot.send_message(
         chat_id,
         f"📝 <b>Nouvelle dictée</b>\n"
-        f"Lettres : {' '.join(ordered(letters))}\n\n"
+        f"Lettres : {' '.join(ordered(letters))}\n"
+        f"{settings_summary(settings_of(context))}\n"
+        "<i>(modifiable avec /reglages)</i>\n\n"
         "Combien de mots veux-tu ?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([buttons]),
@@ -426,7 +770,6 @@ async def send_dictation_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def on_choose_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Étape 2 du menu : choix de la longueur des mots."""
     query = update.callback_query
     await query.answer()
     count = int(query.data.split(":", 1)[1])
@@ -435,8 +778,7 @@ async def on_choose_count(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for key, (label, _) in WORD_LENGTHS.items()
     ]
     await safe_edit_text(
-        query,
-        f"📝 <b>{count} mots</b>\nQuelle longueur de mots ?",
+        query, f"📝 <b>{count} mots</b>\nQuelle longueur de mots ?",
         reply_markup=InlineKeyboardMarkup([buttons]),
     )
 
@@ -453,16 +795,21 @@ async def on_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit_text(query, problem or "⚠️ Relance /dictee.")
         return
 
-    context.user_data["session"] = {
-        "id": secrets.token_hex(4),  # identifie la série → les vieux boutons deviennent inactifs
-        "words": generate_session_words(letters, count, length_key),
-        "index": 0,
-    }
+    settings = settings_of(context)
+    recent: list[str] = context.user_data.setdefault("recent_real", [])
+    words = build_session_words(letters, settings, count, length_key, recent)
+    for w in words:
+        if w["fr"]:
+            recent.append(w["ar"])
+    del recent[:-RECENT_REAL_MAX]
+
+    context.user_data["session"] = {"id": secrets.token_hex(4), "words": words, "index": 0}
+    n_real = sum(1 for w in words if w["fr"])
     await safe_edit_text(
         query,
         f"🎧 <b>C'est parti : {count} mots {WORD_LENGTHS[length_key][0].lower()}</b>\n"
-        "Écoute, écris le mot sur ta feuille, puis vérifie.\n"
-        "Tu peux réécouter la note vocale autant de fois que tu veux.",
+        f"📖 {n_real} vrai(s) mot(s), 🧪 {count - n_real} inventé(s)\n"
+        "Écoute, écris le mot sur ta feuille, puis vérifie.",
     )
     await send_current_word(query.message.chat_id, context)
 
@@ -472,40 +819,25 @@ async def send_current_word(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     index = session["index"]
     total = len(session["words"])
     word = session["words"][index]
-
-    reveal_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("👁️ Afficher la réponse", callback_data=f"R:{session['id']}:{index}")
-    ]])
-
-    await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
-    audio_path: Path | None = None
+    settings = settings_of(context)
     try:
-        audio_path = await synthesize(word)
-        with audio_path.open("rb") as audio:
-            await context.bot.send_voice(
-                chat_id,
-                voice=audio,
-                caption=word_caption(index, total),
-                parse_mode=ParseMode.HTML,
-                reply_markup=reveal_kb,
-            )
+        await send_voice_note(
+            context, chat_id, word["ar"], settings["voice"], SPEEDS[settings["speed"]][1],
+            f"🎧 <b>Mot {index + 1}/{total}</b> — écoute et écris-le sur ta feuille.",
+            word_keyboard(session, index, revealed=False),
+        )
     except Exception:
-        logger.exception("Échec de l'envoi audio pour %s", word)
+        logger.exception("Échec de l'envoi audio pour %s", word["ar"])
         skip_kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("➡️ Mot suivant", callback_data=f"N:{session['id']}:{index}")
         ]])
         await context.bot.send_message(
-            chat_id,
-            f"❌ Impossible de générer l'audio du mot {index + 1}/{total} pour le moment.",
+            chat_id, f"❌ Impossible de générer l'audio du mot {index + 1}/{total} pour le moment.",
             reply_markup=skip_kb,
         )
-    finally:
-        if audio_path:
-            audio_path.unlink(missing_ok=True)  # nettoyage du fichier temporaire
 
 
 def _active_session(context: ContextTypes.DEFAULT_TYPE, data: str) -> tuple[dict, int] | None:
-    """Vérifie qu'un bouton appartient bien à la dictée en cours."""
     _, session_id, raw_index = data.split(":")
     session = context.user_data.get("session")
     index = int(raw_index)
@@ -522,44 +854,54 @@ async def on_reveal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     session, index = found
     await query.answer()
-
     word = session["words"][index]
-    total = len(session["words"])
-    is_last = index == total - 1
-
-    next_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🏁 Voir le bilan" if is_last else "➡️ Mot suivant",
-            callback_data=f"N:{session['id']}:{index}",
-        )
-    ]])
     caption = (
-        f"🎧 <b>Mot {index + 1}/{total}</b>\n\n"
-        f"✍️ <b>{html.escape(word)}</b>\n"
-        f"🔤 {html.escape(spelled_letters(word))}"
+        f"🎧 <b>Mot {index + 1}/{len(session['words'])}</b>\n\n"
+        f"✍️ <b>{html.escape(word['ar'])}</b>\n"
+        f"🔤 {html.escape(spelled_letters(word['ar']))}\n"
+        f"{meaning_line(word)}"
     )
     try:
-        await query.edit_message_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=next_kb)
+        await query.edit_message_caption(
+            caption=caption, parse_mode=ParseMode.HTML,
+            reply_markup=word_keyboard(session, index, revealed=True),
+        )
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             raise
 
 
+async def on_slow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    found = _active_session(context, query.data)
+    if not found:
+        await query.answer("Cette dictée est terminée. Relance /dictee.")
+        return
+    session, index = found
+    await query.answer("Version lente 🐢")
+    settings = settings_of(context)
+    try:
+        await send_voice_note(
+            context, query.message.chat_id, session["words"][index]["ar"], settings["voice"],
+            SLOW_REPLAY_RATE, f"🐢 Mot {index + 1}, au ralenti",
+        )
+    except Exception:
+        logger.exception("Échec de la version lente")
+        await context.bot.send_message(query.message.chat_id, "❌ Version lente indisponible pour le moment.")
+
+
 async def on_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     found = _active_session(context, query.data)
-    # session["index"] != index → bouton déjà utilisé (double clic) : on ignore.
     if not found or found[0]["index"] != found[1]:
         await query.answer("C'est déjà fait ✔️")
         return
     session, _ = found
     await query.answer()
-
     try:
-        await query.edit_message_reply_markup(reply_markup=None)  # garde le fil propre
+        await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-
     session["index"] += 1
     chat_id = query.message.chat_id
     if session["index"] >= len(session["words"]):
@@ -571,8 +913,9 @@ async def on_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.user_data.pop("session")
     lines = [
-        f"{i}. <b>{html.escape(word)}</b>   ({html.escape(spelled_letters(word))})"
-        for i, word in enumerate(session["words"], start=1)
+        f"{i}. <b>{html.escape(w['ar'])}</b> — "
+        + (html.escape(w["fr"]) if w["fr"] else "🧪 inventé")
+        for i, w in enumerate(session["words"], start=1)
     ]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Nouvelle dictée", callback_data="D:NEW")]])
     await context.bot.send_message(
@@ -604,10 +947,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(app: Application) -> None:
-    """Affiche les commandes dans le menu « / » de Telegram."""
     await app.bot.set_my_commands([
-        BotCommand("lettres", "Choisir les lettres apprises"),
         BotCommand("dictee", "Lancer une dictée"),
+        BotCommand("lettres", "Choisir les lettres apprises"),
+        BotCommand("reglages", "Voyelles longues, soukoun, chadda, vitesse"),
+        BotCommand("voix", "Choisir la voix"),
         BotCommand("stop", "Arrêter la dictée en cours"),
         BotCommand("aide", "Comment ça marche"),
     ])
@@ -615,8 +959,10 @@ async def post_init(app: Application) -> None:
 
 def build_application(token: str, builder=None) -> Application:
     """Assemble le bot (séparé de main() pour pouvoir le tester)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_TMP_DIR.mkdir(exist_ok=True)
     clean_temp_audio()
+    REAL_WORDS[:] = load_word_bank(WORDS_FILE)
 
     builder = builder or Application.builder()
     app = (
@@ -628,13 +974,18 @@ def build_application(token: str, builder=None) -> Application:
 
     app.add_handler(CommandHandler(["start", "aide"], cmd_start))
     app.add_handler(CommandHandler("lettres", cmd_letters))
+    app.add_handler(CommandHandler("reglages", cmd_settings))
+    app.add_handler(CommandHandler("voix", cmd_voices))
     app.add_handler(CommandHandler("dictee", cmd_dictation))
     app.add_handler(CommandHandler("stop", cmd_stop))
 
     app.add_handler(CallbackQueryHandler(on_letters, pattern=r"^L:"))
+    app.add_handler(CallbackQueryHandler(on_setting, pattern=r"^O:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_voice, pattern=r"^[VK]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_choose_count, pattern=r"^C:\d+$"))
     app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^G:\d+:\w+$"))
     app.add_handler(CallbackQueryHandler(on_reveal, pattern=r"^R:"))
+    app.add_handler(CallbackQueryHandler(on_slow, pattern=r"^S:"))
     app.add_handler(CallbackQueryHandler(on_next, pattern=r"^N:"))
     app.add_handler(CallbackQueryHandler(on_new_dictation, pattern=r"^D:NEW$"))
 
@@ -645,7 +996,7 @@ def build_application(token: str, builder=None) -> Application:
 def main() -> None:
     if not TOKEN or TOKEN.startswith("COLLE_"):
         raise SystemExit(
-            "TELEGRAM_BOT_TOKEN manquant : ouvre le fichier config.txt et colle le token donné par @BotFather."
+            "TELEGRAM_BOT_TOKEN manquant : ajoute-le (variable Railway, ou config.txt sur ton PC)."
         )
     app = build_application(TOKEN)
     logger.info("Bot démarré — laisse cette fenêtre ouverte. Ctrl+C pour arrêter.")
