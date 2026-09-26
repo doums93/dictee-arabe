@@ -123,12 +123,17 @@ LETTERS_PER_ROW = 4
 REAL_WORD_RATIO = 0.7   # part de vrais mots dans une dictée (le reste est inventé)
 RECENT_REAL_MAX = 80    # vrais mots mémorisés pour éviter de les redonner trop vite
 
-# Longueur des mots, en nombre de syllabes (min, max).
+# Longueur des mots : (libellé, nombre de LETTRES min-max, syllabes tentées par le générateur).
 WORD_LENGTHS = {
-    "court": ("Courts", (1, 2)),
-    "moyen": ("Moyens", (2, 3)),
-    "long": ("Longs", (3, 4)),
+    "court": ("3 lettres", (3, 3), (1, 3)),
+    "moyen": ("4 lettres", (4, 4), (2, 4)),
+    "long": ("5 lettres et +", (5, 7), (3, 5)),
 }
+
+
+def letter_count(word: str) -> int:
+    """Nombre de lettres écrites (les voyelles courtes, soukoun et chadda ne comptent pas)."""
+    return sum(1 for ch in word if ch not in MARKS)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -298,7 +303,7 @@ def eligible_real_words(letters: set[str], settings: dict, length_key: str) -> l
     lo, hi = WORD_LENGTHS[length_key][1]
     return [
         w for w in REAL_WORDS
-        if is_allowed(w, letters, settings) and lo <= max(w.syllables, 1) <= hi
+        if is_allowed(w, letters, settings) and lo <= letter_count(w.arabic) <= hi
     ]
 
 
@@ -408,8 +413,14 @@ def generate_word(letters: set[str], syllables: int, settings: dict) -> str:
 
 
 def invented_word(letters: set[str], length_key: str, settings: dict) -> WordInfo:
-    lo, hi = WORD_LENGTHS[length_key][1]
-    return analyze_word(generate_word(letters, random.randint(lo, hi), settings))
+    """Mot inventé ayant le nombre de lettres demandé (on réessaie jusqu'à tomber juste)."""
+    _, (lo, hi), (syl_lo, syl_hi) = WORD_LENGTHS[length_key]
+    word = ""
+    for _ in range(300):
+        word = generate_word(letters, random.randint(syl_lo, syl_hi), settings)
+        if lo <= letter_count(word) <= hi:
+            break
+    return analyze_word(word)
 
 
 def build_session_words(
@@ -429,13 +440,14 @@ def build_session_words(
     chosen = pool[:n_real]
     taken.update(w.arabic for w in chosen)
 
-    # Longueurs essayées pour inventer un mot nouveau : celle demandée, puis plus longues
-    # (avec très peu de lettres, les mots courts possibles s'épuisent vite).
-    fallback_lengths = [length_key] + [k for k in WORD_LENGTHS if k != length_key]
+    # Longueur demandée d'abord ; en tout dernier recours (plus aucun mot nouveau possible
+    # avec si peu de lettres), une longueur plus grande plutôt qu'un doublon.
+    order = list(WORD_LENGTHS)
+    fallback_lengths = [length_key] + order[order.index(length_key) + 1:]
     while len(chosen) < count:
         word = None
         for key in fallback_lengths:
-            for _ in range(150):
+            for _ in range(200):
                 candidate = invented_word(letters, key, settings)
                 if candidate.arabic not in taken:
                     word = candidate
@@ -597,7 +609,7 @@ async def speak(text: str, voice: str, rate: str) -> bytes:
 SAMPLE_RATE = 24000
 # Secondes ajoutées à chaque voyelle longue en mode normal, selon la lettre de prolongation.
 # Le « aa » (alif) s'entend moins que « ouu » et « ii » : on l'allonge davantage.
-MADD_STRETCH = {"ا": 0.35, "و": 0.22, "ي": 0.22}
+MADD_STRETCH = {"ا": 0.6, "و": 0.45, "ي": 0.45}
 FADE = 0.015          # fondu (s) en fin de mot coupé, pour éviter un « clic »
 
 
@@ -757,9 +769,12 @@ def _psola_stretch(x: "np.ndarray", marks: list[int], extra: int) -> "np.ndarray
     first, last = int(m[0]), int(m[-1])
     length = last - first
     # Correspondance temps de sortie → temps d'entrée : pente 1 aux bords, plus lente au milieu.
+    # Profil en plateau : montée douce sur le 1er quart, allongement constant au milieu,
+    # retour doux sur le dernier quart (l'allongement est réparti sur toute la voyelle).
     tau = np.arange(length + 1, dtype=np.float64)
-    bump = 0.5 - 0.5 * np.cos(2 * np.pi * tau / length)
-    slope = 1.0 + (2.0 * extra / length) * bump
+    ramp = np.clip(np.minimum(tau, length - tau) / (0.25 * length), 0.0, 1.0)
+    bump = 0.5 - 0.5 * np.cos(np.pi * ramp)
+    slope = 1.0 + (extra / max(float(bump.sum()), 1.0)) * bump
     out_time = np.concatenate([[0.0], np.cumsum(slope[:-1])])
     total = int(round(out_time[-1]))
 
@@ -1049,12 +1064,6 @@ def word_keyboard(session: dict, index: int, revealed: bool) -> InlineKeyboardMa
     ])
 
 
-def meaning_line(word: dict) -> str:
-    if word["fr"]:
-        return f"🇫🇷 {html.escape(word['fr'])}"
-    return "🧪 <i>Mot inventé (pas de sens), juste pour l'entraînement</i>"
-
-
 def item_text(item: list[dict]) -> str:
     return " ".join(w["ar"] for w in item)
 
@@ -1067,12 +1076,10 @@ def item_label(session: dict, index: int) -> str:
 def reveal_caption(session: dict, index: int) -> str:
     item = session["items"][index]
     if len(item) == 1:
-        word = item[0]
-        details = f"🔤 {html.escape(spelled_letters(word['ar']))}\n{meaning_line(word)}"
+        details = f"🔤 {html.escape(spelled_letters(item[0]['ar']))}"
     else:
         details = "\n".join(
-            f"• {html.escape(w['ar'])} — " + (html.escape(w["fr"]) if w["fr"] else "🧪 <i>inventé</i>")
-            for w in item
+            f"• {html.escape(w['ar'])}   ({html.escape(spelled_letters(w['ar']))})" for w in item
         )
     return f"🎧 <b>{item_label(session, index)}</b>\n\n✍️ <b>{html.escape(item_text(item))}</b>\n{details}"
 
@@ -1089,8 +1096,8 @@ HELP_TEXT = (
     "3️⃣ /dictee : mots ou phrases, niveau normal (prolongements appuyés) ou difficile\n"
     "🎙️ /voix : choisis la voix qui te parle le mieux\n"
     "⏹ /stop : arrête la dictée en cours\n\n"
-    "Je te dicte surtout de vrais mots (avec leur traduction), et j'invente des mots "
-    "quand il n'en existe pas assez avec tes lettres : ils sont signalés 🧪."
+    "Je te dicte de vrais mots et, quand il n'y en a pas assez avec tes lettres, "
+    "des mots inventés."
 )
 
 
@@ -1289,50 +1296,64 @@ async def on_choose_count(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         options = {key: label for key, (label, _) in PHRASE_LENGTHS.items()}
         question = "Combien de mots par phrase ?"
     else:
-        options = {key: label for key, (label, _) in WORD_LENGTHS.items()}
+        options = {key: label for key, (label, *_rest) in WORD_LENGTHS.items()}
         question = "Quelle longueur de mots ?"
     buttons = [InlineKeyboardButton(label, callback_data=f"G:{mode}:{count}:{key}") for key, label in options.items()]
     await safe_edit_text(query, f"📝 <b>{count} × {'phrase' if mode == 'p' else 'mot'}</b>\n{question}",
                          reply_markup=InlineKeyboardMarkup([buttons]))
 
 
+async def on_choose_phrase_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phrases : après le nombre de mots par phrase, choix de la longueur des mots."""
+    query = update.callback_query
+    await query.answer()
+    _, mode, raw_count, size_key = query.data.split(":")
+    if size_key not in PHRASE_LENGTHS:
+        await safe_edit_text(query, "⚠️ Relance /dictee.")
+        return
+    buttons = [InlineKeyboardButton(label, callback_data=f"H:{mode}:{raw_count}:{size_key}:{key}")
+               for key, (label, *_rest) in WORD_LENGTHS.items()]
+    await safe_edit_text(
+        query,
+        f"📝 <b>{raw_count} × phrase de {PHRASE_LENGTHS[size_key][0]}</b>\nQuelle longueur de mots ?",
+        reply_markup=InlineKeyboardMarkup([buttons]),
+    )
+
+
 async def on_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    _, mode, raw_count, length_key = query.data.split(":")
-    count = int(raw_count)
+    parts = query.data.split(":")
+    mode, count = parts[1], int(parts[2])
+    size_key = parts[3] if mode == "p" else None      # H:p:<nb>:<taille phrase>:<longueur mots>
+    length_key = parts[-1]                             # G:w:<nb>:<longueur mots>
 
     letters: set[str] = context.user_data.get("letters", set())
     problem = letters_problem(letters)
-    lengths = PHRASE_LENGTHS if mode == "p" else WORD_LENGTHS
-    if problem or length_key not in lengths:
+    if problem or length_key not in WORD_LENGTHS or (mode == "p" and size_key not in PHRASE_LENGTHS):
         await safe_edit_text(query, problem or "⚠️ Relance /dictee.")
         return
 
     settings = settings_of(context)
     recent: list[str] = context.user_data.setdefault("recent_real", [])
     if mode == "p":
-        size = PHRASE_LENGTHS[length_key][1]
+        size = PHRASE_LENGTHS[size_key][1]
         taken: set[str] = set()   # aucun mot ne revient d'une phrase à l'autre
-        items = [
-            build_session_words(letters, settings, size, random.choice(["court", "moyen"]), recent, taken)
-            for _ in range(count)
-        ]
-        intro = f"🗣️ <b>C'est parti : {count} phrase(s) de {size} mots</b>\n" \
+        items = [build_session_words(letters, settings, size, length_key, recent, taken) for _ in range(count)]
+        intro = f"🗣️ <b>C'est parti : {count} phrase(s) de {size} mots "\
+                f"({WORD_LENGTHS[length_key][0]})</b>\n" \
                 f"⏸️ {PAUSES[settings['pause']][0]} de pause entre les mots (modifiable dans /reglages)\n"
     else:
         items = [[w] for w in build_session_words(letters, settings, count, length_key, recent)]
-        intro = f"🎧 <b>C'est parti : {count} mots {WORD_LENGTHS[length_key][0].lower()}</b>\n"
+        intro = f"🎧 <b>C'est parti : {count} mots de {WORD_LENGTHS[length_key][0]}</b>\n"
     all_words = [w for item in items for w in item]
     recent.extend(w["ar"] for w in all_words if w["fr"])
     del recent[:-RECENT_REAL_MAX]
 
     context.user_data["session"] = {"id": secrets.token_hex(4), "mode": mode, "items": items, "index": 0}
-    n_real = sum(1 for w in all_words if w["fr"])
     await safe_edit_text(
         query,
         intro + f"{MODES[settings['mode']]}\n"
-        f"📖 {n_real} vrai(s) mot(s), 🧪 {len(all_words) - n_real} inventé(s)\n"
         "Écoute, écris sur ta feuille, puis vérifie.",
     )
     await send_current_item(query.message.chat_id, context)
@@ -1430,12 +1451,7 @@ async def send_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None
     session = context.user_data.pop("session")
     lines = []
     for i, item in enumerate(session["items"], start=1):
-        if len(item) == 1:
-            w = item[0]
-            lines.append(f"{i}. <b>{html.escape(w['ar'])}</b> — "
-                         + (html.escape(w["fr"]) if w["fr"] else "🧪 inventé"))
-        else:
-            lines.append(f"{i}. <b>{html.escape(item_text(item))}</b>")
+        lines.append(f"{i}. <b>{html.escape(item_text(item))}</b>")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Nouvelle dictée", callback_data="D:NEW")]])
     await context.bot.send_message(
         chat_id,
@@ -1503,7 +1519,9 @@ def build_application(token: str, builder=None) -> Application:
     app.add_handler(CallbackQueryHandler(on_choose_mode, pattern=r"^M:[wp]$"))
     app.add_handler(CallbackQueryHandler(on_choose_level, pattern=r"^Z:[wp]:(normal|difficile)$"))
     app.add_handler(CallbackQueryHandler(on_choose_count, pattern=r"^C:[wp]:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^G:[wp]:\d+:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^G:w:\d+:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_choose_phrase_size, pattern=r"^G:p:\d+:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_start_session, pattern=r"^H:p:\d+:\w+:\w+$"))
     app.add_handler(CallbackQueryHandler(on_reveal, pattern=r"^R:"))
     app.add_handler(CallbackQueryHandler(on_slow, pattern=r"^S:"))
     app.add_handler(CallbackQueryHandler(on_next, pattern=r"^N:"))
