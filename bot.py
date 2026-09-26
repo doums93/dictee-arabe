@@ -473,7 +473,7 @@ def build_session_words(
 # Chaque audio se termine ensuite par END_SILENCE secondes de silence.
 
 CARRIER_WORD = "كَمْ"       # mot témoin, coupé de l'audio final
-CARRIER_MARGIN = 0.1        # secondes gardées après la fin du mot (laisse la voyelle finir)
+CARRIER_MARGIN = 0.1        # (version de secours sans ffmpeg) secondes gardées après le mot
 END_SILENCE = 1.0           # secondes de silence ajoutées à la fin de chaque audio
 TICKS_PER_SECOND = 10_000_000
 
@@ -610,7 +610,10 @@ SAMPLE_RATE = 24000
 # Secondes ajoutées à chaque voyelle longue en mode normal, selon la lettre de prolongation.
 # Le « aa » (alif) s'entend moins que « ouu » et « ii » : on l'allonge davantage.
 MADD_STRETCH = {"ا": 0.6, "و": 0.45, "ي": 0.45}
-FADE = 0.04           # extinction (s) en fin de mot coupé : la voix s'éteint, sans « clic »
+FADE = 0.08            # durée (s) de l'extinction douce en fin de mot coupé
+FADE_OVERLAP = 0.02    # l'extinction peut commencer au plus 0,02 s avant la fin officielle du mot
+DECODER_DELAY = 0.045  # retard (s) ajouté par le décodage MP3 par rapport aux repères de la voix
+MAX_TAIL = 0.25        # on garde au plus 0,25 s après la fin du mot (le mot témoin commence après)
 
 
 def _find_ffmpeg() -> str | None:
@@ -855,21 +858,21 @@ def ends_with_vowel(word: str) -> bool:
     return bool(units) and units[-1][0].startswith("L")
 
 
-def natural_end(pcm: "np.ndarray", word_end: float) -> int:
-    """Où couper après le mot : au moment où la voix se tait vraiment (la fermeture silencieuse
-    du « k » du mot témoin), et non à un instant fixe qui tomberait en pleine voyelle."""
-    sr = SAMPLE_RATE
-    frame, hop = sr // 100, sr // 200                     # fenêtres de 10 ms, pas de 5 ms
-    ref_zone = pcm[max(0, int((word_end - 0.15) * sr)): max(1, int((word_end - 0.02) * sr))]
-    ref = float(np.sqrt(np.mean(ref_zone ** 2))) if len(ref_zone) else 0.0
-    start, stop = int((word_end - 0.02) * sr), min(len(pcm) - frame, int((word_end + 0.3) * sr))
-    if ref < 1e-4 or stop <= start:
-        return min(len(pcm), int((word_end + CARRIER_MARGIN) * sr))
-    levels = [(float(np.sqrt(np.mean(pcm[p:p + frame] ** 2))), p) for p in range(start, stop, hop)]
-    for level, pos in levels:
-        if level < 0.08 * ref:                              # la voix est retombée : silence
-            return pos + frame // 2
-    return min(levels)[1] + frame // 2                     # sinon : le point le plus calme
+def carrier_cut(word_end: float, carrier_start: float | None) -> tuple[int, int]:
+    """Où couper l'audio « mot + mot témoin » et où commencer à éteindre la voix.
+
+    Repères donnés par la voix elle-même : fin du mot et début du mot témoin (décalés du petit
+    retard ajouté par le décodage MP3). On garde TOUT le mot, plus l'espace qui le sépare du mot
+    témoin (là où la voyelle finale se termine naturellement), et on coupe juste avant le mot témoin.
+    La voix s'éteint en douceur sur la fin de cet espace : jamais de coupe dans le mot."""
+    end = word_end + DECODER_DELAY
+    if carrier_start is None:
+        cut = end + 0.12
+    else:
+        # Juste avant le mot témoin… mais jamais avant la fin du mot, ni trop loin après.
+        cut = max(end, min(carrier_start + DECODER_DELAY - 0.005, end + MAX_TAIL))
+    fade_start = max(end - FADE_OVERLAP, cut - FADE)
+    return int(cut * SAMPLE_RATE), int(fade_start * SAMPLE_RATE)
 
 
 async def speak_pcm(word: str, voice: str, rate: str) -> tuple["np.ndarray", float | None, float | None]:
@@ -885,9 +888,14 @@ async def speak_pcm(word: str, voice: str, rate: str) -> tuple["np.ndarray", flo
             if carrier:
                 if end is None:
                     raise RuntimeError("repères de mots absents")
-                pcm = pcm[: natural_end(pcm, end)].copy()
-                n = min(len(pcm), int(FADE * SAMPLE_RATE))
-                pcm[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32) ** 2   # extinction douce
+                carrier_start = bounds[1][0] if len(bounds) > 1 else None
+                cut, fade_from = carrier_cut(end, carrier_start)
+                pcm = pcm[:cut].copy()
+                n = len(pcm) - fade_from
+                if n > 0:   # extinction douce (courbe en cosinus) : la voix s'éteint, sans « clic »
+                    pcm[fade_from:] *= (0.5 + 0.5 * np.cos(np.linspace(0, np.pi, n))).astype(np.float32)
+                logger.info("%s : fin du mot %.3f s, mot témoin %.3f s, coupe %.3f s",
+                            word, end, carrier_start or -1, cut / SAMPLE_RATE)
             return pcm, start, end
         except Exception as exc:
             last_error = exc
