@@ -610,7 +610,7 @@ SAMPLE_RATE = 24000
 # Secondes ajoutées à chaque voyelle longue en mode normal, selon la lettre de prolongation.
 # Le « aa » (alif) s'entend moins que « ouu » et « ii » : on l'allonge davantage.
 MADD_STRETCH = {"ا": 0.6, "و": 0.45, "ي": 0.45}
-FADE = 0.015          # fondu (s) en fin de mot coupé, pour éviter un « clic »
+FADE = 0.04           # extinction (s) en fin de mot coupé : la voix s'éteint, sans « clic »
 
 
 def _find_ffmpeg() -> str | None:
@@ -846,9 +846,35 @@ def stretch_long_vowels(pcm: "np.ndarray", word: str, start: float, end: float,
     return pcm
 
 
+def ends_with_vowel(word: str) -> bool:
+    """Le mot finit-il par une voyelle, courte (كَتَبَ) ou longue (هُنَا, فِي) ?
+    Dans les deux cas, lu seul, la voix l'avalerait ou la raccourcirait (lecture « à la pause »)."""
+    if ends_with_short_vowel(word):
+        return True
+    units = phonetic_units(word)
+    return bool(units) and units[-1][0].startswith("L")
+
+
+def natural_end(pcm: "np.ndarray", word_end: float) -> int:
+    """Où couper après le mot : au moment où la voix se tait vraiment (la fermeture silencieuse
+    du « k » du mot témoin), et non à un instant fixe qui tomberait en pleine voyelle."""
+    sr = SAMPLE_RATE
+    frame, hop = sr // 100, sr // 200                     # fenêtres de 10 ms, pas de 5 ms
+    ref_zone = pcm[max(0, int((word_end - 0.15) * sr)): max(1, int((word_end - 0.02) * sr))]
+    ref = float(np.sqrt(np.mean(ref_zone ** 2))) if len(ref_zone) else 0.0
+    start, stop = int((word_end - 0.02) * sr), min(len(pcm) - frame, int((word_end + 0.3) * sr))
+    if ref < 1e-4 or stop <= start:
+        return min(len(pcm), int((word_end + CARRIER_MARGIN) * sr))
+    levels = [(float(np.sqrt(np.mean(pcm[p:p + frame] ** 2))), p) for p in range(start, stop, hop)]
+    for level, pos in levels:
+        if level < 0.08 * ref:                              # la voix est retombée : silence
+            return pos + frame // 2
+    return min(levels)[1] + frame // 2                     # sinon : le point le plus calme
+
+
 async def speak_pcm(word: str, voice: str, rate: str) -> tuple["np.ndarray", float | None, float | None]:
-    """Son d'un mot (PCM) + début et fin du mot, voyelle finale prononcée si besoin."""
-    carrier = ends_with_short_vowel(word)
+    """Son d'un mot (PCM) + début et fin du mot, voyelle finale prononcée en entier."""
+    carrier = ends_with_vowel(word)
     text = f"{word} {CARRIER_WORD}" if carrier else word
     last_error = None
     for candidate in dict.fromkeys((voice, DEFAULT_VOICE)):
@@ -859,9 +885,9 @@ async def speak_pcm(word: str, voice: str, rate: str) -> tuple["np.ndarray", flo
             if carrier:
                 if end is None:
                     raise RuntimeError("repères de mots absents")
-                pcm = pcm[: int((end + CARRIER_MARGIN) * SAMPLE_RATE)].copy()
+                pcm = pcm[: natural_end(pcm, end)].copy()
                 n = min(len(pcm), int(FADE * SAMPLE_RATE))
-                pcm[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32)
+                pcm[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32) ** 2   # extinction douce
             return pcm, start, end
         except Exception as exc:
             last_error = exc
