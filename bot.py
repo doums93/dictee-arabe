@@ -573,13 +573,14 @@ async def speak(text: str, voice: str, rate: str) -> bytes:
 # Traitement du son (ffmpeg + numpy) : coupe précise, prolongements, silences
 # ---------------------------------------------------------------------------
 #
-# Mode normal : on ÉTIRE le son des voyelles longues directement dans l'audio. Une voyelle
-# est une vibration régulière (une « période » se répète) : on repère le milieu de la
-# voyelle longue, on mesure sa période et on répète quelques périodes. La voyelle dure
-# plus longtemps sans changer de timbre ni de hauteur, et le reste du mot est intact.
+# Mode normal : on ÉTIRE le son des voyelles longues directement dans l'audio (TD-PSOLA).
+# Une voyelle est une vibration régulière : on repère chaque vibration de la voyelle longue
+# puis on la rejoue en l'étalant progressivement, avec un fondu entre chaque vibration.
+# La voyelle dure plus longtemps en gardant ses variations naturelles ; le reste du mot
+# n'est pas modifié.
 
 SAMPLE_RATE = 24000
-MADD_STRETCH = 0.30   # secondes ajoutées à chaque voyelle longue en mode normal
+MADD_STRETCH = 0.22   # secondes ajoutées à chaque voyelle longue en mode normal
 FADE = 0.015          # fondu (s) en fin de mot coupé, pour éviter un « clic »
 
 
@@ -663,62 +664,152 @@ def _periodicity(frame: "np.ndarray") -> tuple[float, int]:
     return float(ac[lag] / ac[0]), lag
 
 
-def _best_loop_length(pcm: "np.ndarray", a: int, target: int, period: int) -> int:
-    """Longueur (≈ target) pour laquelle le son se répète le mieux à partir de `a` :
-    les copies s'enchaînent alors sans à-coup."""
-    n = max(period, SAMPLE_RATE // 100)
-    ref = pcm[a: a + n]
-    best_len, best_corr = target, -1.0
-    for length in range(max(period, target - period // 2), target + period // 2 + 1):
-        seg = pcm[a + length: a + length + n]
-        if len(seg) < n or len(ref) < n:
+def _local_strength(x: "np.ndarray", pos: int, win: int) -> tuple[float, int, float]:
+    frame = x[max(0, pos - win // 2): pos + win // 2]
+    if len(frame) < win // 2:
+        return 0.0, 0, 0.0
+    strength, period = _periodicity(frame)
+    return strength, period, float(np.sqrt(np.mean(frame ** 2)))
+
+
+def _find_vowel(x: "np.ndarray", center: int, half: int) -> tuple[int, int, int] | None:
+    """Repère la voyelle longue près de `center` : (début, fin, période) en échantillons."""
+    win = int(0.03 * SAMPLE_RATE)
+    best, best_score, period = None, 0.0, 0
+    for pos in range(max(win, center - half), min(len(x) - win, center + half) + 1, SAMPLE_RATE // 200):
+        strength, p, rms = _local_strength(x, pos, win)
+        score = strength * rms * (1.0 - 0.5 * abs(pos - center) / max(half, 1))
+        if strength > 0.5 and score > best_score:
+            best, best_score, period = pos, score, p
+    if best is None:
+        return None
+    _, _, ref_rms = _local_strength(x, best, win)
+    step = max(period // 2, 1)
+    limit = int(0.3 * SAMPLE_RATE)
+
+    def inside(pos: int) -> bool:
+        s, _, r = _local_strength(x, pos, max(win, 2 * period))
+        return s > 0.45 and r > 0.35 * ref_rms
+
+    start = best
+    while start - step > max(win, best - limit) and inside(start - step):
+        start -= step
+    end = best
+    while end + step < min(len(x) - win, best + limit) and inside(end + step):
+        end += step
+    return start, end, period
+
+
+def _pitch_marks(x: "np.ndarray", start: int, end: int, period: int) -> list[int]:
+    """Un repère par vibration de la voix (période), suivi pas à pas entre start et end."""
+    center = (start + end) // 2
+    seg = x[center - period // 2: center + period // 2]
+    first = center - period // 2 + int(np.argmax(seg))
+
+    def follow(mark: int, direction: int) -> list[int]:
+        marks, p = [], period
+        while True:
+            ref = x[mark - p // 2: mark + p // 2]
+            best_lag, best_corr = None, 0.3
+            for lag in range(int(0.8 * p), int(1.2 * p) + 1):
+                nxt = mark + direction * lag
+                cand = x[nxt - p // 2: nxt + p // 2]
+                if len(cand) != len(ref) or len(ref) == 0:
+                    break
+                corr = float(np.dot(ref, cand) / (np.linalg.norm(ref) * np.linalg.norm(cand) + 1e-9))
+                if corr > best_corr:
+                    best_lag, best_corr = lag, corr
+            if best_lag is None:
+                return marks
+            mark += direction * best_lag
+            p = best_lag
+            if not (start <= mark <= end):
+                return marks
+            marks.append(mark)
+
+    return sorted(follow(first, -1) + [first] + follow(first, +1))
+
+
+def _psola_stretch(x: "np.ndarray", marks: list[int], extra: int) -> "np.ndarray":
+    """Allonge la zone entre le premier et le dernier repère de `extra` échantillons.
+    L'allongement est progressif (nul aux bords, maximal au milieu de la voyelle) et chaque
+    vibration est recollée avec un fondu (fenêtre de Hann) : c'est la méthode TD-PSOLA."""
+    m = np.asarray(marks)
+    periods = np.diff(m)
+    p_at = np.concatenate([[periods[0]], (periods[:-1] + periods[1:]) // 2, [periods[-1]]])
+    first, last = int(m[0]), int(m[-1])
+    length = last - first
+    # Correspondance temps de sortie → temps d'entrée : pente 1 aux bords, plus lente au milieu.
+    tau = np.arange(length + 1, dtype=np.float64)
+    bump = 0.5 - 0.5 * np.cos(2 * np.pi * tau / length)
+    slope = 1.0 + (2.0 * extra / length) * bump
+    out_time = np.concatenate([[0.0], np.cumsum(slope[:-1])])
+    total = int(round(out_time[-1]))
+
+    new_len = len(x) + total - length
+    y = np.zeros(new_len + 4 * int(p_at.max()), dtype=np.float64)
+    wsum = np.zeros_like(y)
+
+    # Partie avant la voyelle (fondu sortant sur une période, complété par le 1er grain).
+    p0 = int(p_at[0])
+    left = np.ones(first, dtype=np.float64)
+    left[-p0:] = 0.5 + 0.5 * np.cos(np.pi * np.arange(1, p0 + 1) / p0)
+    y[:first] += x[:first] * left
+    wsum[:first] += left
+
+    # Grains : un par vibration de sortie, pris sur la vibration d'entrée correspondante.
+    t = 0.0
+    while True:
+        in_pos = first + float(np.interp(t, out_time, tau))
+        j = int(np.argmin(np.abs(m - in_pos)))
+        p = int(p_at[j])
+        grain = x[m[j] - p: m[j] + p]
+        if len(grain) == 2 * p:
+            window = np.hanning(2 * p)
+            at = first + int(round(t)) - p
+            y[at: at + 2 * p] += grain * window
+            wsum[at: at + 2 * p] += window
+        if t >= total:
             break
-        corr = float(np.dot(ref, seg) / (np.linalg.norm(ref) * np.linalg.norm(seg) + 1e-9))
-        if corr > best_corr:
-            best_len, best_corr = length, corr
-    return best_len
+        t = min(t + p, float(total))
+
+    # Partie après la voyelle (fondu entrant sur une période).
+    pn = int(p_at[-1])
+    tail = x[last:]
+    right = np.ones(len(tail), dtype=np.float64)
+    right[:pn] = 0.5 - 0.5 * np.cos(np.pi * np.arange(pn) / pn)
+    at = first + total
+    y[at: at + len(tail)] += tail * right
+    wsum[at: at + len(tail)] += right
+
+    y = y[:new_len]
+    wsum = wsum[:new_len]
+    return (y / np.maximum(wsum, 1e-3)).astype(np.float32)
 
 
 def stretch_long_vowels(pcm: "np.ndarray", word: str, start: float, end: float,
                         extra: float = MADD_STRETCH) -> "np.ndarray":
-    """Allonge chaque voyelle longue du mot de `extra` secondes."""
+    """Allonge chaque voyelle longue du mot d'environ `extra` secondes (TD-PSOLA)."""
     units = phonetic_units(word)
     total = sum(w for _, w in units)
     if not total or end <= start:
         return pcm
-    targets = []
-    cumul = 0.0
+    targets, cumul = [], 0.0
     for kind, weight in units:
         if kind == "L":
             center = start + (end - start) * (cumul + weight / 2) / total
             half = (end - start) * weight / total * 0.6
-            targets.append((center, half))
+            targets.append((int(center * SAMPLE_RATE), int(half * SAMPLE_RATE)))
         cumul += weight
-
-    win = int(0.03 * SAMPLE_RATE)
     for center, half in reversed(targets):   # de la fin vers le début : les indices restent valables
-        c, h = int(center * SAMPLE_RATE), int(half * SAMPLE_RATE)
-        best, best_score, best_period = None, 0.0, 0
-        for pos in range(max(win, c - h), min(len(pcm) - win, c + h) + 1, SAMPLE_RATE // 200):
-            frame = pcm[pos - win // 2: pos + win // 2]
-            strength, period = _periodicity(frame)
-            closeness = 1.0 - 0.5 * abs(pos - c) / max(h, 1)   # préfère le centre estimé
-            score = strength * float(np.sqrt(np.mean(frame ** 2))) * closeness
-            if strength > 0.5 and score > best_score:
-                best, best_score, best_period = pos, score, period
-        if best is None:
-            continue   # pas de voyelle nette trouvée : on ne touche à rien
-        k = max(1, round(0.03 * SAMPLE_RATE / best_period))
-        block = _best_loop_length(pcm, best - best_period * k // 2, best_period * k, best_period)
-        a = max(block, best - block // 2)
-        # Boucle d'une durée « block » : sa fin est fondue vers le son qui précède `a`,
-        # si bien que chaque copie s'enchaîne sans à-coup avec la suivante… et avec pcm[a].
-        loop = pcm[a: a + block].copy()
-        n = max(8, best_period // 2)
-        ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
-        loop[-n:] = loop[-n:] * (1 - ramp) + pcm[a - n: a] * ramp
-        reps = max(1, round(extra * SAMPLE_RATE / block))
-        pcm = np.concatenate([pcm[:a], np.tile(loop, reps), pcm[a:]])
+        found = _find_vowel(pcm, center, half)
+        if not found:
+            continue
+        v_start, v_end, period = found
+        marks = _pitch_marks(pcm, v_start, v_end, period)
+        if len(marks) < 4 or marks[-1] - marks[0] < 3 * period:
+            continue   # voyelle trop courte ou irrégulière : on n'y touche pas
+        pcm = _psola_stretch(pcm, marks, int(extra * SAMPLE_RATE))
     return pcm
 
 
