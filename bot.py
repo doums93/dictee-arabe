@@ -87,6 +87,16 @@ SPEEDS = {
 }
 SLOW_REPLAY_RATE = "-50%"   # bouton « 🐢 Plus lentement »
 
+# Mode de dictée : « normal » appuie sur les voyelles longues pour qu'elles s'entendent bien,
+# « difficile » garde la prononciation naturelle.
+MODES = {
+    "normal": "🟢 Normal : prolongements appuyés",
+    "difficile": "🔴 Difficile : voix naturelle",
+}
+# Mode normal : nombre de lettres de prolongation AJOUTÉES à l'oral (بَاب → بَاااب lu par la
+# voix ; l'écriture affichée reste بَاب).
+MADD_EXTRA = 2
+
 # Pause entre les mots d'une phrase (clé : libellé, secondes).
 PAUSES = {"0.5": ("0,5 s", 0.5), "1": ("1 s", 1.0), "2": ("2 s", 2.0), "3": ("3 s", 3.0)}
 
@@ -96,6 +106,7 @@ DEFAULT_SETTINGS = {
     "sukun": False,    # soukoun ( ْ )
     "shadda": False,   # chadda ( ّ )
     "hamza": False,    # hamza sur alif (أ إ)
+    "mode": "normal",  # normal = prolongements appuyés, difficile = voix naturelle
     "speed": "lente",
     "pause": "1",      # pause entre les mots d'une phrase
     "voice": DEFAULT_VOICE,
@@ -554,9 +565,33 @@ async def speak(text: str, voice: str, rate: str) -> bytes:
     return await asyncio.to_thread(_gtts_audio, text)
 
 
-async def render_audio(words: list[str], voice: str, rate: str, pause: float) -> bytes:
+def emphasize_long_vowels(word: str, extra: int) -> str:
+    """Texte LU par la voix : chaque voyelle longue est écrite 1 + `extra` fois pour que la
+    voix la tienne plus longtemps (كِتَابْ → كِتَاااابْ). L'écriture affichée ne change pas."""
+    if extra <= 0:
+        return word
+    out: list[str] = []
+    prev_vowel = None
+    for i, ch in enumerate(word):
+        out.append(ch)
+        if ch in SHORT_VOWELS:
+            prev_vowel = ch
+            continue
+        if ch in MARKS:
+            if ch == SUKUN:
+                prev_vowel = None
+            continue
+        next_is_mark = i + 1 < len(word) and word[i + 1] in MARKS
+        if not next_is_mark and LONG_VOWEL_LETTER.get(prev_vowel) == ch:
+            out.append(ch * extra)  # lettre de prolongation sans signe, après la bonne voyelle
+        prev_vowel = None
+    return "".join(out)
+
+
+async def render_audio(words: list[str], voice: str, rate: str, pause: float, madd_extra: int = 0) -> bytes:
     """Audio final : un mot, ou une phrase mot par mot avec `pause` secondes entre les mots,
-    puis END_SILENCE secondes de silence."""
+    puis END_SILENCE secondes de silence. `madd_extra` > 0 appuie sur les voyelles longues."""
+    words = [emphasize_long_vowels(w, madd_extra) for w in words]
     segments = await asyncio.gather(*(speak(w, voice, rate) for w in words))
     formats = {mp3_format(s) for s in segments}
     if len(segments) > 1 and (len(formats) != 1 or None in formats):
@@ -570,10 +605,10 @@ async def render_audio(words: list[str], voice: str, rate: str, pause: float) ->
 
 async def send_voice_note(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, words: list[str], voice: str, rate: str,
-    pause: float, caption: str, reply_markup: InlineKeyboardMarkup | None = None,
+    pause: float, caption: str, reply_markup: InlineKeyboardMarkup | None = None, madd_extra: int = 0,
 ) -> None:
     await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
-    audio = await render_audio(words, voice, rate, pause)
+    audio = await render_audio(words, voice, rate, pause, madd_extra)
     await context.bot.send_voice(
         chat_id, voice=audio, filename="dictee.mp3", caption=caption,
         parse_mode=ParseMode.HTML, reply_markup=reply_markup,
@@ -596,16 +631,20 @@ def settings_of(context: ContextTypes.DEFAULT_TYPE) -> dict:
         settings.setdefault(key, value)
     if settings["voice"] not in {v for v, _ in VOICES}:
         settings["voice"] = DEFAULT_VOICE
+    settings.pop("madd_extra", None)  # réglage d'une version précédente
+    if settings["mode"] not in MODES:
+        settings["mode"] = DEFAULT_SETTINGS["mode"]
     if settings["pause"] not in PAUSES:
         settings["pause"] = DEFAULT_SETTINGS["pause"]
     return settings
 
 
-def audio_params(settings: dict, slow: bool = False) -> tuple[str, str, float]:
-    """(voix, débit, pause entre les mots) selon les réglages de l'élève."""
+def audio_params(settings: dict, slow: bool = False) -> tuple[str, str, float, int]:
+    """(voix, débit, pause entre les mots, prolongation ajoutée) selon les réglages de l'élève."""
     rate = SLOW_REPLAY_RATE if slow else SPEEDS[settings["speed"]][1]
     pause = PAUSES[settings["pause"]][1] * (1.5 if slow else 1)
-    return settings["voice"], rate, pause
+    extra = MADD_EXTRA if settings["mode"] == "normal" else 0
+    return settings["voice"], rate, pause, extra
 
 
 def voice_label(voice: str) -> str:
@@ -616,6 +655,7 @@ def settings_summary(settings: dict) -> str:
     def mark(key: str) -> str:
         return "✅" if settings[key] else "❌"
     return (
+        f"{MODES[settings['mode']]}\n"
         f"{mark('long')} voyelles longues   {mark('sukun')} soukoun   "
         f"{mark('shadda')} chadda   {mark('hamza')} hamza\n"
         f"🔊 {voice_label(settings['voice']).split(' —')[0]}, vitesse "
@@ -628,6 +668,7 @@ def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     def toggle(key: str, label: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(f"{'✅' if settings[key] else '❌'} {label}", callback_data=f"O:{key}")
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Mode {MODES[settings['mode']]}", callback_data="O:mode")],
         [toggle("long", "Voyelles longues (ا و ي)")],
         [toggle("sukun", "Soukoun ( ـْ )"), toggle("shadda", "Chadda ( ـّ )")],
         [toggle("hamza", "Hamza (أ إ)")],
@@ -751,7 +792,7 @@ HELP_TEXT = (
     "السَّلَامُ عَلَيْكُم 👋\n\n"
     "Je t'aide à t'entraîner à la <b>dictée en arabe</b>.\n\n"
     "1️⃣ /lettres : coche les lettres que tu as déjà apprises\n"
-    "2️⃣ /reglages : voyelles longues, soukoun, chadda, hamza, vitesse, pauses\n"
+    "2️⃣ /reglages : mode normal ou difficile, voyelles longues, soukoun, chadda, hamza, vitesse, pauses\n"
     "3️⃣ /dictee : dictée de mots ou de phrases, avec uniquement ce que tu as vu\n"
     "🎙️ /voix : choisis la voix qui te parle le mieux\n"
     "⏹ /stop : arrête la dictée en cours\n\n"
@@ -850,8 +891,8 @@ async def on_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.answer()
         await send_voices_menu(query.message.chat_id, context)
         return
-    if key in ("speed", "pause"):
-        options = list(SPEEDS if key == "speed" else PAUSES)
+    if key in ("speed", "pause", "mode"):
+        options = list({"speed": SPEEDS, "pause": PAUSES, "mode": MODES}[key])
         settings[key] = options[(options.index(settings[key]) + 1) % len(options)]
     elif key in ("long", "sukun", "shadda", "hamza"):
         settings[key] = not settings[key]
@@ -990,12 +1031,12 @@ async def send_current_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     session = context.user_data["session"]
     index = session["index"]
     item = session["items"][index]
-    voice, rate, pause = audio_params(settings_of(context))
+    voice, rate, pause, extra = audio_params(settings_of(context))
     try:
         await send_voice_note(
             context, chat_id, [w["ar"] for w in item], voice, rate, pause,
             f"🎧 <b>{item_label(session, index)}</b> — écoute et écris sur ta feuille.",
-            word_keyboard(session, index, revealed=False),
+            word_keyboard(session, index, revealed=False), madd_extra=extra,
         )
     except Exception:
         logger.exception("Échec de l'envoi audio pour %s", item_text(item))
@@ -1043,11 +1084,11 @@ async def on_slow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     session, index = found
     await query.answer("Version lente 🐢")
-    voice, rate, pause = audio_params(settings_of(context), slow=True)
+    voice, rate, pause, extra = audio_params(settings_of(context), slow=True)
     try:
         await send_voice_note(
             context, query.message.chat_id, [w["ar"] for w in session["items"][index]], voice, rate, pause,
-            f"🐢 {item_label(session, index)}, au ralenti",
+            f"🐢 {item_label(session, index)}, au ralenti", madd_extra=extra,
         )
     except Exception:
         logger.exception("Échec de la version lente")
