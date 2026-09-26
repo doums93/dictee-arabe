@@ -426,6 +426,81 @@ async def _synthesize_edge(text: str, voice: str, rate: str, dest: Path) -> None
         raise RuntimeError("fichier audio vide")
 
 
+# --- Prononcer la voyelle finale -------------------------------------------------------
+# Seul, un mot est lu « à la pause » : la voix avale sa dernière voyelle (كَتَبَ → katab).
+# Pour l'apprentissage, on veut « kataba ». Astuce : on fait lire le mot suivi d'un mot
+# témoin (le mot n'est alors plus en fin de phrase, sa voyelle finale est prononcée),
+# puis on coupe l'audio juste après le mot grâce aux repères de temps envoyés par edge-tts.
+
+CARRIER_WORD = "كَمْ"       # mot témoin, coupé de l'audio final
+CARRIER_MARGIN = 0.06       # secondes gardées après la fin du mot (évite de couper la voyelle)
+TICKS_PER_SECOND = 10_000_000
+
+
+def ends_with_short_vowel(word: str) -> bool:
+    """La dernière lettre porte-t-elle une voyelle courte (ثُمَّ, كَتَبَ, نَحْنُ) ?"""
+    trailing = set()
+    for ch in reversed(word):
+        if ch not in MARKS:
+            break
+        trailing.add(ch)
+    return bool(trailing & set(SHORT_VOWELS))
+
+
+_MP3_BITRATES = {
+    1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],   # MPEG-1 couche III
+    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],       # MPEG-2 / 2.5 couche III
+}
+_MP3_RATES = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000]}
+
+
+def trim_mp3(data: bytes, seconds: float) -> bytes | None:
+    """Garde les trames MP3 (couche III) qui commencent avant `seconds`. None si illisible."""
+    pos = 0
+    if data[:3] == b"ID3" and len(data) >= 10:  # en-tête ID3v2 éventuel
+        pos = 10 + ((data[6] << 21) | (data[7] << 14) | (data[8] << 7) | data[9])
+    start, elapsed, frames = pos, 0.0, 0
+    while pos + 4 <= len(data) and elapsed < seconds:
+        sync, info, fmt = data[pos], data[pos + 1], data[pos + 2]
+        if sync != 0xFF or (info & 0xE0) != 0xE0:
+            break
+        version, layer = (info >> 3) & 3, (info >> 1) & 3
+        bitrate_idx, rate_idx, padding = (fmt >> 4) & 0xF, (fmt >> 2) & 3, (fmt >> 1) & 1
+        if version == 1 or layer != 1 or bitrate_idx in (0, 15) or rate_idx == 3:
+            break
+        mpeg1 = version == 3
+        bitrate = _MP3_BITRATES[1 if mpeg1 else 2][bitrate_idx] * 1000
+        rate = _MP3_RATES[version][rate_idx]
+        length = (144 if mpeg1 else 72) * bitrate // rate + padding
+        if length <= 4:
+            break
+        pos += length
+        elapsed += (1152 if mpeg1 else 576) / rate
+        frames += 1
+    if frames == 0:
+        return None
+    return data[:min(pos, len(data))] if start == 0 else data[start:min(pos, len(data))]
+
+
+async def _synthesize_edge_full_vowel(text: str, voice: str, rate: str, dest: Path) -> None:
+    communicate = edge_tts.Communicate(
+        f"{text} {CARRIER_WORD}", voice, rate=rate, boundary="WordBoundary"
+    )
+    audio = bytearray()
+    word_end: float | None = None
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio += chunk["data"]
+        elif chunk["type"] == "WordBoundary" and word_end is None:
+            word_end = (chunk["offset"] + chunk["duration"]) / TICKS_PER_SECOND
+    if word_end is None or not audio:
+        raise RuntimeError("repères de mots absents")
+    trimmed = trim_mp3(bytes(audio), word_end + CARRIER_MARGIN)
+    if not trimmed:
+        raise RuntimeError("découpage MP3 impossible")
+    dest.write_bytes(trimmed)
+
+
 def _synthesize_gtts(text: str, dest: Path) -> None:
     gTTS(text=text, lang="ar", slow=True).save(str(dest))
 
@@ -436,6 +511,12 @@ async def synthesize(text: str, voice: str, rate: str) -> Path:
     os.close(fd)
     path = Path(name)
     try:
+        if ends_with_short_vowel(text):
+            try:
+                await _synthesize_edge_full_vowel(text, voice, rate, path)
+                return path
+            except Exception as exc:
+                logger.warning("Voyelle finale non forcée pour %s (%s)", text, exc)
         try:
             await _synthesize_edge(text, voice, rate, path)
         except Exception as exc:
