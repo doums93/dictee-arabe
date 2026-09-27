@@ -88,8 +88,8 @@ VOICE_SAMPLE = "بَابْ ، كِتَابْ ، قَلَمْ ، شَمْسْ"
 # Vitesses proposées dans /reglages (clé : libellé, débit edge-tts).
 SPEEDS = {
     "normale": ("Normale", "+0%"),
-    "lente": ("Lente", "-20%"),
-    "tres_lente": ("Très lente", "-40%"),
+    "lente": ("Lente", "-35%"),
+    "tres_lente": ("Très lente", "-45%"),
 }
 SLOW_REPLAY_RATE = "-50%"   # bouton « 🐢 Plus lentement »
 
@@ -401,9 +401,12 @@ def generate_word(letters: set[str], syllables: int, settings: dict) -> str:
                     coda = random.choice(allowed)
                     parts.append(coda + SUKUN)
 
-        # 4) Préparer la syllabe suivante.
+        # 4) Préparer la syllabe suivante (on évite la même lettre deux fois de suite : « رِرَ »
+        #    se dit mal et s'entend mal ; impossible seulement s'il n'y a qu'une consonne).
         prev_coda = coda
         avoid_next = {coda} if coda else ({long_letter} if want_long else set())
+        if onset:
+            avoid_next.add(onset)
         gem_rate = 0.15 if sukun_ok else 0.25
         if (shadda_ok and not is_last and not want_long and coda is None
                 and not had_shadda and random.random() < gem_rate):
@@ -475,6 +478,8 @@ def build_session_words(
 CARRIER_WORD = "كَمْ"       # mot témoin, coupé de l'audio final
 CARRIER_MARGIN = 0.1        # (version de secours sans ffmpeg) secondes gardées après le mot
 END_SILENCE = 1.0           # secondes de silence ajoutées à la fin de chaque audio
+START_SILENCE = 0.35        # secondes de silence au début : le téléphone « avale » souvent le tout
+                            # début d'une note vocale ; sans elle, la 1re syllabe peut se perdre
 TICKS_PER_SECOND = 10_000_000
 
 
@@ -610,6 +615,7 @@ SAMPLE_RATE = 24000
 # Mode normal : chaque voyelle longue est amenée à MADD_TARGET secondes (au moins +MADD_MIN_ADD).
 # Durée visée identique pour ا و ي, quelle que soit la façon dont la voix l'a prononcée.
 MADD_TARGET = 0.45
+MADD_TARGET_FINAL = 0.65   # en fin de mot, la voix s'éteint sur la voyelle : il faut plus long
 MADD_MIN_ADD = 0.12
 FADE = 0.03            # durée (s) de l'extinction en fin de mot coupé (dans le silence du « k »)
 DECODER_DELAY = 0.045  # retard (s) ajouté par le décodage MP3 par rapport aux repères de la voix
@@ -1026,7 +1032,8 @@ def locate_long_vowels(final: "np.ndarray", probe: "np.ndarray", probe_marks: li
     mapping = dtw_map(probe, final)
     to_final = lambda pos: int(mapping[min(len(mapping) - 1, max(0, pos // hop))]) * hop
     found = []
-    for piece, letter, sonorant in zip(pieces, letters, onsets):
+    finals = [j == len(word) - 1 for j in positions]
+    for piece, letter, sonorant, is_final in zip(pieces, letters, onsets, finals):
         if piece >= len(starts):
             return []
         a = int(starts[piece] * SAMPLE_RATE)
@@ -1049,7 +1056,8 @@ def locate_long_vowels(final: "np.ndarray", probe: "np.ndarray", probe_marks: li
             refined = _vowel_part(final, syl_a, syl_b, sonorant) or refined
         if refined[1] - refined[0] > min_len:
             current = (refined[1] - refined[0]) / SAMPLE_RATE
-            found.append((refined[0], refined[1], max(MADD_MIN_ADD, MADD_TARGET - current)))
+            target = MADD_TARGET_FINAL if is_final else MADD_TARGET
+            found.append((refined[0], refined[1], max(MADD_MIN_ADD, target - current)))
     # jamais deux zones qui se chevauchent
     found.sort()
     for k in range(1, len(found)):
@@ -1168,7 +1176,7 @@ async def render_audio_processed(words: list[str], voice: str, rate: str, pause:
                                  stretch: bool) -> tuple[bytes, str]:
     parts = await asyncio.gather(*(speak_pcm(w, voice, rate, stretch) for w in words))
     gap = np.zeros(int(pause * SAMPLE_RATE), dtype=np.float32)
-    audio = parts[0]
+    audio = np.concatenate([np.zeros(int(START_SILENCE * SAMPLE_RATE), dtype=np.float32), parts[0]])
     for part in parts[1:]:
         audio = np.concatenate([audio, gap, part])
     audio = np.concatenate([audio, np.zeros(int(END_SILENCE * SAMPLE_RATE), dtype=np.float32)])
@@ -1184,7 +1192,8 @@ async def render_audio_simple(words: list[str], voice: str, rate: str, pause: fl
     audio = segments[0]
     for segment in segments[1:]:
         audio += mp3_silence(audio, pause) + segment[_audio_start(segment):]
-    return audio + mp3_silence(audio, END_SILENCE)
+    start = audio[:_audio_start(audio)]
+    return start + mp3_silence(audio, START_SILENCE) + audio[len(start):] + mp3_silence(audio, END_SILENCE)
 
 
 async def render_audio(words: list[str], voice: str, rate: str, pause: float,
