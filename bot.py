@@ -607,13 +607,12 @@ async def speak(text: str, voice: str, rate: str) -> bytes:
 # n'est pas modifié.
 
 SAMPLE_RATE = 24000
-# Secondes ajoutées à chaque voyelle longue en mode normal, selon la lettre de prolongation.
-# Le « aa » (alif) s'entend moins que « ouu » et « ii » : on l'allonge davantage.
-MADD_STRETCH = {"ا": 0.6, "و": 0.45, "ي": 0.45}
-FADE = 0.08            # durée (s) de l'extinction douce en fin de mot coupé
-FADE_OVERLAP = 0.02    # l'extinction peut commencer au plus 0,02 s avant la fin officielle du mot
+# Mode normal : chaque voyelle longue est amenée à MADD_TARGET secondes (au moins +MADD_MIN_ADD).
+# Durée visée identique pour ا و ي, quelle que soit la façon dont la voix l'a prononcée.
+MADD_TARGET = 0.45
+MADD_MIN_ADD = 0.12
+FADE = 0.03            # durée (s) de l'extinction en fin de mot coupé (dans le silence du « k »)
 DECODER_DELAY = 0.045  # retard (s) ajouté par le décodage MP3 par rapport aux repères de la voix
-MAX_TAIL = 0.25        # on garde au plus 0,25 s après la fin du mot (le mot témoin commence après)
 
 
 def _find_ffmpeg() -> str | None:
@@ -682,18 +681,24 @@ def phonetic_units(word: str) -> list[tuple[str, float]]:
 
 
 def _periodicity(frame: "np.ndarray") -> tuple[float, int]:
-    """(force de la vibration régulière 0→1, période en échantillons) d'un extrait."""
+    """(régularité 0→1, période en échantillons) d'un extrait : corrélation NORMALISÉE entre
+    l'extrait et lui-même décalé d'une période (≈ 1 pour une voyelle tenue)."""
     x = frame - frame.mean()
-    energy = float(np.dot(x, x))
-    if energy < 1e-6:
+    n = len(x)
+    if n < 64 or float(np.dot(x, x)) < 1e-6:
         return 0.0, 0
-    lo, hi = SAMPLE_RATE // 400, SAMPLE_RATE // 70      # voix entre 70 et 400 Hz
-    spectrum = np.fft.rfft(x, 2 * len(x))
-    ac = np.fft.irfft(spectrum * np.conj(spectrum))[: len(x)]
-    if hi >= len(ac):
+    lo, hi = SAMPLE_RATE // 400, min(SAMPLE_RATE // 70, n // 2)   # voix entre 70 et 400 Hz
+    if hi <= lo:
         return 0.0, 0
-    lag = lo + int(np.argmax(ac[lo:hi]))
-    return float(ac[lag] / ac[0]), lag
+    spectrum = np.fft.rfft(x, 2 * n)
+    ac = np.fft.irfft(spectrum * np.conj(spectrum))[:n]
+    energy = np.cumsum(x ** 2)
+    lags = np.arange(lo, hi)
+    head = energy[n - lags - 1]                           # énergie de x[0 : n-lag]
+    tail = energy[-1] - energy[lags - 1]                  # énergie de x[lag : n]
+    r = ac[lo:hi] / np.sqrt(head * tail + 1e-12)
+    k = int(np.argmax(r))
+    return float(r[k]), int(lags[k])
 
 
 def _local_strength(x: "np.ndarray", pos: int, win: int) -> tuple[float, int, float]:
@@ -702,34 +707,6 @@ def _local_strength(x: "np.ndarray", pos: int, win: int) -> tuple[float, int, fl
         return 0.0, 0, 0.0
     strength, period = _periodicity(frame)
     return strength, period, float(np.sqrt(np.mean(frame ** 2)))
-
-
-def _find_vowel(x: "np.ndarray", center: int, half: int) -> tuple[int, int, int] | None:
-    """Repère la voyelle longue près de `center` : (début, fin, période) en échantillons."""
-    win = int(0.03 * SAMPLE_RATE)
-    best, best_score, period = None, 0.0, 0
-    for pos in range(max(win, center - half), min(len(x) - win, center + half) + 1, SAMPLE_RATE // 200):
-        strength, p, rms = _local_strength(x, pos, win)
-        score = strength * rms * (1.0 - 0.5 * abs(pos - center) / max(half, 1))
-        if strength > 0.5 and score > best_score:
-            best, best_score, period = pos, score, p
-    if best is None:
-        return None
-    _, _, ref_rms = _local_strength(x, best, win)
-    step = max(period // 2, 1)
-    limit = int(0.3 * SAMPLE_RATE)
-
-    def inside(pos: int) -> bool:
-        s, _, r = _local_strength(x, pos, max(win, 2 * period))
-        return s > 0.45 and r > 0.35 * ref_rms
-
-    start = best
-    while start - step > max(win, best - limit) and inside(start - step):
-        start -= step
-    end = best
-    while end + step < min(len(x) - win, best + limit) and inside(end + step):
-        end += step
-    return start, end, period
 
 
 def _pitch_marks(x: "np.ndarray", start: int, end: int, period: int) -> list[int]:
@@ -822,99 +799,374 @@ def _psola_stretch(x: "np.ndarray", marks: list[int], extra: int) -> "np.ndarray
     return (y / np.maximum(wsum, 1e-3)).astype(np.float32)
 
 
-def stretch_long_vowels(pcm: "np.ndarray", word: str, start: float, end: float,
-                        extra: dict | None = None) -> "np.ndarray":
-    """Allonge chaque voyelle longue du mot d'environ `extra` secondes (TD-PSOLA)."""
-    units = phonetic_units(word)
-    total = sum(w for _, w in units)
-    if not total or end <= start:
-        return pcm
-    targets, cumul = [], 0.0
-    extra = extra or MADD_STRETCH
-    for kind, weight in units:
-        if kind.startswith("L"):
-            center = start + (end - start) * (cumul + weight / 2) / total
-            half = (end - start) * weight / total * 0.6
-            targets.append((int(center * SAMPLE_RATE), int(half * SAMPLE_RATE), extra[kind[1]]))
-        cumul += weight
-    for center, half, seconds in reversed(targets):   # de la fin vers le début : indices valables
-        found = _find_vowel(pcm, center, half)
-        if not found:
-            continue
-        v_start, v_end, period = found
-        marks = _pitch_marks(pcm, v_start, v_end, period)
-        if len(marks) < 4 or marks[-1] - marks[0] < 3 * period:
-            continue   # voyelle trop courte ou irrégulière : on n'y touche pas
-        pcm = _psola_stretch(pcm, marks, int(seconds * SAMPLE_RATE))
-    return pcm
-
-
 def ends_with_vowel(word: str) -> bool:
     """Le mot finit-il par une voyelle, courte (كَتَبَ) ou longue (هُنَا, فِي) ?
-    Dans les deux cas, lu seul, la voix l'avalerait ou la raccourcirait (lecture « à la pause »)."""
+    Lu seul, la voix l'avalerait ou la raccourcirait (lecture « à la pause »)."""
     if ends_with_short_vowel(word):
         return True
     units = phonetic_units(word)
     return bool(units) and units[-1][0].startswith("L")
 
 
-def carrier_cut(word_end: float, carrier_start: float | None) -> tuple[int, int]:
-    """Où couper l'audio « mot + mot témoin » et où commencer à éteindre la voix.
+# --- Repérage exact des voyelles longues -------------------------------------------------
+#
+# La voix ne donne des repères de temps que par MOT. Astuce (validée sur la vraie voix) :
+# on insère un séparateur invisible (espace de largeur nulle) autour de chaque syllabe à
+# voyelle longue — « كِ|تَا|بْ ». La voix renvoie alors un repère par morceau, qui tombe
+# exactement au début et à la fin de la syllabe. Cette version « sonde » se prononce de façon
+# un peu hachée : on ne l'envoie jamais à l'élève. On aligne simplement ses repères sur
+# l'audio normal (quasi identique) par alignement temporel dynamique (DTW).
 
-    Repères donnés par la voix elle-même : fin du mot et début du mot témoin (décalés du petit
-    retard ajouté par le décodage MP3). On garde TOUT le mot, plus l'espace qui le sépare du mot
-    témoin (là où la voyelle finale se termine naturellement), et on coupe juste avant le mot témoin.
-    La voix s'éteint en douceur sur la fin de cet espace : jamais de coupe dans le mot."""
-    end = word_end + DECODER_DELAY
-    if carrier_start is None:
-        cut = end + 0.12
-    else:
-        # Juste avant le mot témoin… mais jamais avant la fin du mot, ni trop loin après.
-        cut = max(end, min(carrier_start + DECODER_DELAY - 0.005, end + MAX_TAIL))
-    fade_start = max(end - FADE_OVERLAP, cut - FADE)
-    return int(cut * SAMPLE_RATE), int(fade_start * SAMPLE_RATE)
+ZWSP = "​"
 
 
-async def speak_pcm(word: str, voice: str, rate: str) -> tuple["np.ndarray", float | None, float | None]:
-    """Son d'un mot (PCM) + début et fin du mot, voyelle finale prononcée en entier."""
+def long_vowel_positions(word: str) -> list[int]:
+    """Index des lettres de prolongation : ا après fatha, و après damma, ي après kasra,
+    sans signe propre (les signes de la consonne peuvent être dans n'importe quel ordre)."""
+    positions = []
+    for j, ch in enumerate(word):
+        if ch not in "اوي" or (j + 1 < len(word) and word[j + 1] in MARKS):
+            continue
+        k, vowel = j - 1, None
+        while k >= 0 and word[k] in MARKS:
+            if word[k] in SHORT_VOWELS:
+                vowel = word[k]
+            k -= 1
+        if vowel and LONG_VOWEL_LETTER[vowel] == ch and k >= 0:
+            positions.append(j)
+    return positions
+
+
+def probe_text(word: str) -> tuple[str, list[int]]:
+    """Texte « sonde » + index des morceaux qui contiennent une voyelle longue."""
+    positions = long_vowel_positions(word)
+    cut_before, cut_after = set(), set()
+    for j in positions:
+        k = j - 1
+        while k > 0 and word[k] in MARKS:
+            k -= 1                                      # k = consonne qui porte la voyelle
+        if k > 0:
+            cut_before.add(k)
+        if j < len(word) - 1:
+            cut_after.add(j)
+    out, piece_of_letter, piece = [], {}, 0
+    for j, ch in enumerate(word):
+        if j in cut_before and out and out[-1] != ZWSP:
+            out.append(ZWSP)
+            piece += 1
+        out.append(ch)
+        piece_of_letter[j] = piece
+        if j in cut_after:
+            out.append(ZWSP)
+            piece += 1
+    return "".join(out), [piece_of_letter[j] for j in positions]
+
+
+def _features(x: "np.ndarray") -> "np.ndarray":
+    """Empreinte spectrale toutes les 10 ms (forme du spectre, indépendante du volume)."""
+    win, hop = 600, 240
+    if len(x) < win:
+        x = np.pad(x, (0, win - len(x)))
+    frames = np.lib.stride_tricks.sliding_window_view(x, win)[::hop] * np.hanning(win)
+    spec = np.abs(np.fft.rfft(frames, 1024)) ** 2
+    bands = np.log(spec @ _MEL.T + 1e-8)
+    bands -= bands.mean(1, keepdims=True)
+    return bands / (np.linalg.norm(bands, axis=1, keepdims=True) + 1e-9)
+
+
+def _mel_bank(n: int = 26, nfft: int = 1024) -> "np.ndarray":
+    f = np.linspace(0, SAMPLE_RATE / 2, nfft // 2 + 1)
+    to_mel = lambda h: 2595 * np.log10(1 + h / 700)
+    pts = 700 * (10 ** (np.linspace(to_mel(60), to_mel(7000), n + 2) / 2595) - 1)
+    bank = np.zeros((n, len(f)))
+    for k in range(n):
+        lo, c, hi = pts[k:k + 3]
+        bank[k] = np.clip(np.minimum((f - lo) / (c - lo), (hi - f) / (hi - c)), 0, None)
+    return bank
+
+
+_MEL = _mel_bank() if np is not None else None
+
+
+def dtw_map(src: "np.ndarray", dst: "np.ndarray") -> "np.ndarray":
+    """Pour chaque trame de `src`, la trame correspondante de `dst` (alignement DTW)."""
+    a, b = _features(src), _features(dst)
+    cost = 1.0 - a @ b.T
+    n, m = cost.shape
+    acc = np.full((n + 1, m + 1), np.inf)
+    acc[0, 0] = 0.0
+    for i in range(1, n + 1):
+        row, prev = acc[i], acc[i - 1]
+        for j in range(1, m + 1):
+            c = cost[i - 1, j - 1]
+            row[j] = c + min(prev[j - 1], prev[j] + 0.5 * c, row[j - 1] + 0.5 * c)
+    i, j, mapping = n, m, np.zeros(n)
+    while i > 0 and j > 0:
+        mapping[i - 1] = j - 1
+        step = int(np.argmin((acc[i - 1, j - 1], acc[i - 1, j], acc[i, j - 1])))
+        if step == 0:
+            i, j = i - 1, j - 1
+        elif step == 1:
+            i -= 1
+        else:
+            j -= 1
+    return mapping
+
+
+SONORANTS = set("لمنرويه")   # consonnes « chantées » : pas de silence entre elles et la voyelle
+
+
+def _frame_stats(x: "np.ndarray", a: int, b: int, win: int = 480, hop: int = 120):
+    """Par trame de 20 ms entre a et b : (position, volume, part d'énergie sous 3 kHz)."""
+    out = []
+    freqs = np.fft.rfftfreq(1024, 1 / SAMPLE_RATE)
+    low = freqs < 3000
+    for pos in range(max(a, win // 2), min(b, len(x) - win // 2), hop):
+        frame = x[pos - win // 2: pos + win // 2] * np.hanning(win)
+        spec = np.abs(np.fft.rfft(frame, 1024)) ** 2
+        total = float(spec.sum()) + 1e-12
+        out.append((pos, float(np.sqrt(np.mean(frame ** 2))), float(spec[low].sum()) / total))
+    return out
+
+
+def _vowel_part(x: "np.ndarray", a: int, b: int, sonorant: bool = False) -> tuple[int, int] | None:
+    """Dans la syllabe [a, b] (consonne + voyelle longue) : la voyelle = plus longue zone forte
+    (≥ 30 % du volume max) dont l'énergie est grave (< 3 kHz) : silences, explosions et
+    sifflantes sont exclus. Les 25 premières ms (fin possible de la voyelle précédente) ne
+    comptent pas. Si la consonne est « chantée » (ل م ن…), la voyelle est la fin de la zone."""
+    skip = int(0.025 * SAMPLE_RATE)
+    rows = _frame_stats(x, a + skip, b)
+    if not rows:
+        return None
+    top = max(r[1] for r in rows)
+    good = [r[1] > 0.3 * top and r[2] > 0.85 for r in rows]
+    best, cur = None, None
+    for k, ok in enumerate(good):
+        if ok:
+            cur = (cur[0], k) if cur else (k, k)
+            if not best or cur[1] - cur[0] > best[1] - best[0]:
+                best = cur
+        else:
+            cur = None
+    if not best or (best[1] - best[0]) * 120 < 0.04 * SAMPLE_RATE:
+        return None
+    start, end = rows[best[0]][0], rows[best[1]][0]
+    if sonorant:
+        start += int(0.3 * (end - start))
+    return start, end
+
+
+def wsola_stretch(x: "np.ndarray", intervals: list[tuple[int, int, float]]) -> "np.ndarray":
+    """Allonge chaque voyelle [début, fin] de `secondes` par WSOLA (méthode de l'effet
+    « atempo ») : on recopie le son par petits morceaux de 20 ms qui se chevauchent, en
+    choisissant à chaque fois le morceau qui prolonge le mieux le précédent. Ailleurs, le son
+    est restitué à l'identique. Fonctionne aussi sur une voix irrégulière (fin de mot)."""
+    if not intervals:
+        return x
+    n_in = len(x)
+    slope = np.ones(n_in)
+    for a, b, seconds in intervals:
+        a, b = max(0, a), min(n_in, b)
+        length = b - a
+        if length < 200:
+            continue
+        tau = np.arange(length, dtype=np.float64)
+        ramp = np.clip(np.minimum(tau, length - tau) / (0.25 * length), 0.0, 1.0)
+        bump = 0.5 - 0.5 * np.cos(np.pi * ramp)                  # montée douce, plateau, descente
+        slope[a:b] += seconds * SAMPLE_RATE * bump / bump.sum()
+    out_time = np.concatenate([[0.0], np.cumsum(slope)])        # temps de sortie de chaque échantillon
+    n_out = int(out_time[-1])
+    frame, hop, tol = 480, 240, 120
+    window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(frame) / frame)   # somme = 1 à 50 %
+    padded = np.concatenate([np.zeros(frame + tol), x, np.zeros(4 * frame + 2 * tol)]).astype(np.float64)
+    off = frame + tol
+    y = np.zeros(n_out + 4 * frame)
+    prev, prev_target = None, None
+    for k in range(-hop, n_out + hop, hop):
+        t_in = np.interp(k, out_time, np.arange(n_in + 1)) if k >= 0 else k   # avant 0 : identité
+        target = int(round(t_in)) + off
+        if prev is None or target - prev_target == hop:
+            # hors voyelle (le temps avance normalement) : on recopie la suite exacte du son
+            pos = target if prev is None else prev + hop
+        else:
+            ref = padded[prev + hop: prev + hop + frame]
+            best, pos = -np.inf, target
+            for cand in range(target - tol, target + tol + 1, 4):
+                seg = padded[cand: cand + frame]
+                score = float(np.dot(seg, ref)) / (np.linalg.norm(seg) * np.linalg.norm(ref) + 1e-9)
+                if score > best:
+                    best, pos = score, cand
+        start = k + frame
+        piece = padded[pos: pos + frame]
+        if start >= 0 and len(piece) == frame:
+            y[start: start + frame] += piece * window
+        prev, prev_target = pos, target
+    return y[frame: frame + n_out].astype(np.float32)
+
+
+def stretch_at(pcm: "np.ndarray", intervals: list[tuple[int, int, float]]) -> "np.ndarray":
+    return wsola_stretch(pcm, intervals)
+
+
+def locate_long_vowels(final: "np.ndarray", probe: "np.ndarray", probe_marks: list,
+                       word: str, end_limit: float) -> list:
+    """Voyelles longues dans l'audio final, à partir des repères de la sonde."""
+    _, pieces = probe_text(word)
+    positions = long_vowel_positions(word)
+    letters = [word[j] for j in positions]
+    onsets = []
+    for j in positions:
+        k = j - 1
+        while k > 0 and word[k] in MARKS:
+            k -= 1
+        onsets.append(word[k] in SONORANTS)
+    starts = [m[0] + DECODER_DELAY for m in probe_marks]
+    hop = 240
+    probe = probe[: int(end_limit * SAMPLE_RATE)]
+    mapping = dtw_map(probe, final)
+    to_final = lambda pos: int(mapping[min(len(mapping) - 1, max(0, pos // hop))]) * hop
+    found = []
+    for piece, letter, sonorant in zip(pieces, letters, onsets):
+        if piece >= len(starts):
+            return []
+        a = int(starts[piece] * SAMPLE_RATE)
+        b = int(starts[piece + 1] * SAMPLE_RATE) if piece + 1 < len(starts) else len(probe)
+        vowel = _vowel_part(probe, a, b, sonorant)
+        if not vowel:
+            continue
+        # la syllabe dans l'audio final : on ne cherche la voyelle QU'À L'INTÉRIEUR
+        syl_a, syl_b = to_final(a), to_final(b) + hop
+        fa, fb = to_final(vowel[0]), to_final(vowel[1]) + hop
+        lo, hi = max(syl_a, fa - 3 * hop // 2), min(syl_b, fb + 3 * hop // 2)
+        refined = _vowel_part(final, lo, hi, sonorant) if hi - lo > 0.05 * SAMPLE_RATE else None
+        mapped = (max(fa, syl_a), min(fb, syl_b))
+        min_len = 0.04 * SAMPLE_RATE
+        if not refined or refined[1] - refined[0] < 0.6 * (mapped[1] - mapped[0]):
+            refined = mapped            # affinage douteux : on garde la zone donnée par l'alignement
+        if refined[1] - refined[0] < min_len:
+            # la voix a prononcé cette voyelle longue presque brève : on la cherche dans
+            # toute la syllabe (c'est justement là que l'allongement est le plus utile)
+            refined = _vowel_part(final, syl_a, syl_b, sonorant) or refined
+        if refined[1] - refined[0] > min_len:
+            current = (refined[1] - refined[0]) / SAMPLE_RATE
+            found.append((refined[0], refined[1], max(MADD_MIN_ADD, MADD_TARGET - current)))
+    # jamais deux zones qui se chevauchent
+    found.sort()
+    for k in range(1, len(found)):
+        if found[k][0] < found[k - 1][1]:
+            middle = (found[k][0] + found[k - 1][1]) // 2
+            found[k - 1] = (found[k - 1][0], middle, found[k - 1][2])
+            found[k] = (middle, found[k][1], found[k][2])
+    return [f for f in found if f[1] - f[0] > 0.04 * SAMPLE_RATE]
+
+
+# --- Fin de mot : coupe juste avant le « k » du mot témoin ------------------------------
+
+def carrier_cut(pcm: "np.ndarray", carrier_start: float) -> int:
+    """Le mot témoin « كَمْ » commence par un « k » : tenue silencieuse, puis explosion.
+    Le repère de la voix peut tomber AVANT la vraie fin du mot (la dernière voyelle déborde) :
+    on part de ce repère et on avance jusqu'au vrai silence du « k » (creux profond), puis
+    jusqu'à son explosion ; on coupe juste avant. Tout le mot est donc conservé (validé sur
+    la vraie voix, 44 mots)."""
+    hop, win = SAMPLE_RATE // 200, SAMPLE_RATE // 100
+    frames = np.lib.stride_tricks.sliding_window_view(pcm, win)[::hop]
+    level = 10 * np.log10((frames ** 2).mean(1) + 1e-10)
+    top = level.max()
+    k = max(0, int((carrier_start + DECODER_DELAY - 0.03) * SAMPLE_RATE) // hop)
+    limit = min(len(level) - 1, k + int(0.4 * SAMPLE_RATE) // hop)
+    # 1) le silence du « k » : premier creux profond (≥ 30 dB sous le maximum)
+    while k < limit and level[k] > top - 30:
+        k += 1
+    if k >= limit:
+        return int((carrier_start + DECODER_DELAY + 0.08) * SAMPLE_RATE)   # secours
+    # 2) le fond du creux, puis l'explosion (remontée de 15 dB)
+    quiet = k
+    while quiet + 1 < limit and level[quiet + 1] <= level[quiet] + 3 and level[quiet + 1] < top - 25:
+        quiet += 1
+        if level[quiet] < level[k]:
+            k = quiet
+    burst = k
+    while burst < limit and level[burst] < level[k] + 15:
+        burst += 1
+    return max(k * hop + win // 2, burst * hop - int(0.008 * SAMPLE_RATE))
+
+
+def silence_bounds(pcm: "np.ndarray") -> tuple[int, int]:
+    """Retire le long silence que la voix ajoute avant et après le mot (jusqu'à 1 s), en gardant
+    une marge : 0,05 s avant le premier son, 0,12 s après le dernier (détente des consonnes
+    finales comprise : seuil très bas, -50 dB sous le maximum)."""
+    hop = SAMPLE_RATE // 100
+    if len(pcm) < 4 * hop:
+        return 0, len(pcm)
+    frames = np.lib.stride_tricks.sliding_window_view(pcm, hop)[::hop]
+    level = 10 * np.log10((frames ** 2).mean(1) + 1e-12)
+    loud = np.nonzero(level > level.max() - 50)[0]
+    if not len(loud):
+        return 0, len(pcm)
+    start = max(0, loud[0] * hop - int(0.05 * SAMPLE_RATE))
+    end = min(len(pcm), (loud[-1] + 1) * hop + int(0.12 * SAMPLE_RATE))
+    return start, end
+
+
+def _fade_out(pcm: "np.ndarray", seconds: float = FADE) -> "np.ndarray":
+    n = min(len(pcm), int(seconds * SAMPLE_RATE))
+    if n > 0:
+        pcm = pcm.copy()
+        pcm[-n:] *= (0.5 + 0.5 * np.cos(np.linspace(0, np.pi, n))).astype(np.float32)
+    return pcm
+
+
+async def speak_pcm(word: str, voice: str, rate: str, stretch: bool = False) -> "np.ndarray":
+    """Son d'un mot, prononcé en entier (voyelle finale comprise), voyelles longues allongées
+    en mode normal."""
     carrier = ends_with_vowel(word)
-    text = f"{word} {CARRIER_WORD}" if carrier else word
+    suffix = f" {CARRIER_WORD}" if carrier else ""
+    probe, pieces = probe_text(word)
+    letters = [word[j] for j in long_vowel_positions(word)]
+    want_stretch = stretch and bool(pieces) and len(letters) == len(pieces)
     last_error = None
     for candidate in dict.fromkeys((voice, DEFAULT_VOICE)):
         try:
-            mp3, bounds = await _edge_audio(text, candidate, rate, word_boundary=True)
+            jobs = [_edge_audio(word + suffix, candidate, rate, word_boundary=True)]
+            if want_stretch:
+                jobs.append(_edge_audio(probe + suffix, candidate, rate, word_boundary=True))
+            results = await asyncio.gather(*jobs)
+            mp3, bounds = results[0]
             pcm = await decode_pcm(mp3)
-            start, end = bounds[0] if bounds else (None, None)
+            end_limit = len(pcm) / SAMPLE_RATE
             if carrier:
-                if end is None:
+                if len(bounds) < 2:
                     raise RuntimeError("repères de mots absents")
-                carrier_start = bounds[1][0] if len(bounds) > 1 else None
-                cut, fade_from = carrier_cut(end, carrier_start)
-                pcm = pcm[:cut].copy()
-                n = len(pcm) - fade_from
-                if n > 0:   # extinction douce (courbe en cosinus) : la voix s'éteint, sans « clic »
-                    pcm[fade_from:] *= (0.5 + 0.5 * np.cos(np.linspace(0, np.pi, n))).astype(np.float32)
-                logger.info("%s : fin du mot %.3f s, mot témoin %.3f s, coupe %.3f s",
-                            word, end, carrier_start or -1, cut / SAMPLE_RATE)
-            return pcm, start, end
+                cut = carrier_cut(pcm, bounds[-1][0])
+                end_limit = cut / SAMPLE_RATE
+                pcm = _fade_out(pcm[:cut])
+            # silences ajoutés par la voix, mesurés AVANT l'allongement (mêmes bornes dans les 2 modes)
+            keep_from, keep_to = silence_bounds(pcm)
+            tail = len(pcm) - keep_to
+            if want_stretch:
+                try:
+                    probe_mp3, probe_bounds = results[1]
+                    probe_pcm = await decode_pcm(probe_mp3)
+                    probe_marks = probe_bounds[:-1] if carrier else probe_bounds
+                    probe_end = carrier_cut(probe_pcm, probe_bounds[-1][0]) / SAMPLE_RATE if carrier \
+                        else len(probe_pcm) / SAMPLE_RATE
+                    targets = locate_long_vowels(pcm, probe_pcm, probe_marks, word, probe_end)
+                    logger.info("%s : voyelles longues à %s", word,
+                                [(round(a / SAMPLE_RATE, 3), round(b / SAMPLE_RATE, 3)) for a, b, _ in targets])
+                    pcm = stretch_at(pcm, targets)
+                except Exception:
+                    logger.exception("Prolongement impossible pour %s", word)
+            return pcm[keep_from: len(pcm) - tail]
         except Exception as exc:
             last_error = exc
             logger.warning("edge-tts en échec avec %s pour %s (%s)", candidate, word, exc)
     logger.warning("Repli sur gTTS pour %s (%s)", word, last_error)
-    return await decode_pcm(await asyncio.to_thread(_gtts_audio, word)), None, None
+    return await decode_pcm(await asyncio.to_thread(_gtts_audio, word))
 
 
 async def render_audio_processed(words: list[str], voice: str, rate: str, pause: float,
                                  stretch: bool) -> tuple[bytes, str]:
-    segments = await asyncio.gather(*(speak_pcm(w, voice, rate) for w in words))
-    parts = []
-    for word, (pcm, start, end) in zip(words, segments):
-        if stretch and start is not None:
-            try:
-                pcm = stretch_long_vowels(pcm, word, start, end)
-            except Exception:
-                logger.exception("Prolongement impossible pour %s", word)
-        parts.append(pcm)
+    parts = await asyncio.gather(*(speak_pcm(w, voice, rate, stretch) for w in words))
     gap = np.zeros(int(pause * SAMPLE_RATE), dtype=np.float32)
     audio = parts[0]
     for part in parts[1:]:
